@@ -53,7 +53,13 @@ class NetworkScanner:
                 print(f"Callback error: {e}")
     
     def get_default_subnet(self) -> Optional[str]:
-        """Auto-detect the default network subnet."""
+        """Get the default network subnet - from config or auto-detect."""
+        # First, check if DEFAULT_SUBNET is set in config/env
+        if settings.DEFAULT_SUBNET:
+            print(f"Using configured subnet: {settings.DEFAULT_SUBNET}")
+            return settings.DEFAULT_SUBNET
+        
+        # Auto-detect if not configured
         if NETIFACES_AVAILABLE:
             try:
                 # Get default gateway interface
@@ -78,12 +84,16 @@ class NetworkScanner:
                         mask_bits = sum(bin(x).count('1') for x in mask_parts)
                         
                         network = '.'.join(str(x) for x in network_parts)
-                        return f"{network}/{mask_bits}"
+                        detected_subnet = f"{network}/{mask_bits}"
+                        print(f"Auto-detected subnet: {detected_subnet}")
+                        return detected_subnet
             except Exception as e:
                 print(f"Error detecting subnet: {e}")
         
         # Fallback to common home network
-        return "192.168.1.0/24"
+        fallback = "192.168.1.0/24"
+        print(f"Using fallback subnet: {fallback}")
+        return fallback
     
     async def start_background_scanning(self):
         """Start background network scanning."""

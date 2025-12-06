@@ -3,9 +3,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
 from typing import Optional
 from datetime import datetime, timedelta
+import ipaddress
 
 from ..db.database import get_db
 from ..db.models import Device, ScanEvent, ScanSession
+from ..core.config import settings
 from .schemas import (
     DeviceResponse,
     DeviceUpdate,
@@ -30,6 +32,58 @@ async def get_devices(
     """Get all devices with optional filtering."""
     query = select(Device)
     
+    # Filter by configured subnet if DEFAULT_SUBNET is set
+    if settings.DEFAULT_SUBNET:
+        try:
+            network = ipaddress.ip_network(settings.DEFAULT_SUBNET, strict=False)
+            # Filter devices to only those in the configured subnet
+            query = query.where(Device.ip_address != None)
+            result = await db.execute(query)
+            all_devices = result.scalars().all()
+            
+            # Filter in Python since SQL doesn't have built-in CIDR matching
+            devices_in_subnet = []
+            for device in all_devices:
+                if device.ip_address:
+                    try:
+                        ip = ipaddress.ip_address(device.ip_address)
+                        if ip in network:
+                            devices_in_subnet.append(device)
+                    except ValueError:
+                        pass
+            
+            # Re-apply other filters
+            if online_only:
+                devices_in_subnet = [d for d in devices_in_subnet if d.is_online]
+            
+            if search:
+                search_term = search.lower()
+                devices_in_subnet = [
+                    d for d in devices_in_subnet
+                    if (d.hostname and search_term in d.hostname.lower()) or
+                       (d.custom_name and search_term in d.custom_name.lower()) or
+                       (d.ip_address and search_term in d.ip_address.lower()) or
+                       (d.mac_address and search_term in d.mac_address.lower()) or
+                       (d.vendor and search_term in d.vendor.lower())
+                ]
+            
+            # Sort
+            devices_in_subnet.sort(key=lambda d: (not d.is_online, d.last_seen or datetime.min), reverse=True)
+            
+            total = len(devices_in_subnet)
+            devices = devices_in_subnet[skip:skip+limit]
+            
+            return DeviceListResponse(
+                devices=[DeviceResponse.model_validate(d) for d in devices],
+                total=total,
+                skip=skip,
+                limit=limit
+            )
+        except Exception as e:
+            print(f"Error filtering by subnet: {e}")
+            # Fall through to normal query
+    
+    # Normal query without subnet filtering
     if online_only:
         query = query.where(Device.is_online == True)
     
@@ -226,6 +280,52 @@ async def rescan_device(device_id: int, db: AsyncSession = Depends(get_db)):
     await db.refresh(device)
     
     return DeviceResponse.model_validate(device)
+
+
+@router.delete("/devices/cleanup-subnet")
+async def cleanup_devices_outside_subnet(db: AsyncSession = Depends(get_db)):
+    """Delete all devices that are outside the configured subnet."""
+    if not settings.DEFAULT_SUBNET:
+        raise HTTPException(
+            status_code=400, 
+            detail="No DEFAULT_SUBNET configured. Cannot cleanup."
+        )
+    
+    try:
+        network = ipaddress.ip_network(settings.DEFAULT_SUBNET, strict=False)
+        
+        # Get all devices
+        result = await db.execute(select(Device))
+        all_devices = result.scalars().all()
+        
+        devices_to_delete = []
+        for device in all_devices:
+            if device.ip_address:
+                try:
+                    ip = ipaddress.ip_address(device.ip_address)
+                    if ip not in network:
+                        devices_to_delete.append(device)
+                except ValueError:
+                    # Invalid IP, delete it
+                    devices_to_delete.append(device)
+            else:
+                # No IP address, keep it for now
+                pass
+        
+        # Delete devices outside subnet
+        deleted_count = 0
+        for device in devices_to_delete:
+            await db.delete(device)
+            deleted_count += 1
+        
+        await db.commit()
+        
+        return {
+            "message": f"Deleted {deleted_count} devices outside subnet {settings.DEFAULT_SUBNET}",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error cleaning up devices: {str(e)}")
 
 
 @router.get("/dashboard/stats", response_model=DashboardStats)
