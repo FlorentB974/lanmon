@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import aiohttp
 import json
+import threading
 
 # mDNS/DNS-SD constants
 MDNS_ADDR = "224.0.0.251"
@@ -30,6 +31,35 @@ SSDP_PORT = 1900
 
 # NetBIOS constants
 NETBIOS_PORT = 137
+
+# Shared Zeroconf instance management
+_zeroconf_instance = None
+_zeroconf_lock = threading.Lock()
+_zeroconf_services_cache: Dict[str, List[tuple]] = {}  # IP -> [(service_type, name, info)]
+_zeroconf_last_scan = None
+
+def _get_zeroconf():
+    """Get or create a shared Zeroconf instance."""
+    global _zeroconf_instance
+    with _zeroconf_lock:
+        if _zeroconf_instance is None:
+            try:
+                from zeroconf import Zeroconf
+                _zeroconf_instance = Zeroconf()
+            except Exception:
+                pass
+        return _zeroconf_instance
+
+def _close_zeroconf():
+    """Close the shared Zeroconf instance."""
+    global _zeroconf_instance
+    with _zeroconf_lock:
+        if _zeroconf_instance is not None:
+            try:
+                _zeroconf_instance.close()
+            except Exception:
+                pass
+            _zeroconf_instance = None
 
 # Common service ports for device type detection
 COMMON_PORTS = {
@@ -218,7 +248,17 @@ class DeviceInfoScanner:
         Returns:
             List of EnhancedDeviceInfo objects
         """
-        semaphore = asyncio.Semaphore(8)
+        # First, do a single mDNS scan to populate the cache for all devices
+        device_ips = set()
+        for d in devices:
+            ip = d.get('ip') or d.get('ip_address')
+            if ip:
+                device_ips.add(ip)
+        
+        await self._scan_mdns_bulk(device_ips)
+        
+        # Reduce concurrency to avoid socket exhaustion
+        semaphore = asyncio.Semaphore(4)
 
         async def wrapped(device: Dict) -> EnhancedDeviceInfo:
             ip = device.get('ip') or device.get('ip_address')
@@ -227,7 +267,103 @@ class DeviceInfoScanner:
                 return await self.get_device_info(ip, mac)
 
         tasks = [wrapped(d) for d in devices]
-        return await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Clean up after scan
+        _close_zeroconf()
+        
+        return results
+    
+    async def _scan_mdns_bulk(self, ips: set):
+        """
+        Perform a single mDNS scan to discover services for all IPs at once.
+        This avoids creating multiple Zeroconf instances which exhausts socket buffers.
+        """
+        global _zeroconf_services_cache
+        _zeroconf_services_cache.clear()
+        
+        try:
+            from zeroconf import Zeroconf, ServiceBrowser
+        except ImportError:
+            return
+        
+        service_types = [
+            "_http._tcp.local.",
+            "_https._tcp.local.",
+            "_airplay._tcp.local.",
+            "_raop._tcp.local.",
+            "_googlecast._tcp.local.",
+            "_spotify-connect._tcp.local.",
+            "_homekit._tcp.local.",
+            "_hap._tcp.local.",
+            "_printer._tcp.local.",
+            "_ipp._tcp.local.",
+            "_pdl-datastream._tcp.local.",
+            "_scanner._tcp.local.",
+            "_smb._tcp.local.",
+            "_afpovertcp._tcp.local.",
+            "_ssh._tcp.local.",
+            "_device-info._tcp.local.",
+            "_companion-link._tcp.local.",
+            "_sonos._tcp.local.",
+        ]
+        
+        zc = _get_zeroconf()
+        if zc is None:
+            return
+            
+        class BulkListener:
+            def __init__(self):
+                self.services = []
+                
+            def add_service(self, zc, type_, name):
+                self.services.append((type_, name))
+                
+            def remove_service(self, zc, type_, name):
+                pass
+                
+            def update_service(self, zc, type_, name):
+                pass
+        
+        listener = BulkListener()
+        browsers = []
+        
+        try:
+            for st in service_types:
+                try:
+                    browser = ServiceBrowser(zc, st, listener)
+                    browsers.append(browser)
+                except Exception:
+                    pass
+            
+            # Wait for responses
+            await asyncio.sleep(2.0)
+            
+            # Process discovered services and cache by IP
+            for service_type, name in listener.services:
+                try:
+                    sinfo = zc.get_service_info(service_type, name, timeout=500)
+                    if sinfo and sinfo.addresses:
+                        for addr in sinfo.addresses:
+                            try:
+                                ip = socket.inet_ntoa(addr)
+                                if ip in ips:
+                                    if ip not in _zeroconf_services_cache:
+                                        _zeroconf_services_cache[ip] = []
+                                    _zeroconf_services_cache[ip].append((service_type, name, sinfo))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            print(f"Bulk mDNS scan error: {e}")
+        finally:
+            for browser in browsers:
+                try:
+                    browser.cancel()
+                except Exception:
+                    pass
     
     async def _resolve_dns(self, ip: str, info: EnhancedDeviceInfo):
         """Resolve hostname via DNS (reverse lookup + fqdn)."""
@@ -279,107 +415,44 @@ class DeviceInfoScanner:
                     info.services.append(service)
     
     async def _probe_mdns(self, ip: str, info: EnhancedDeviceInfo):
-        """Query mDNS/Bonjour for device services."""
+        """Query mDNS/Bonjour for device services using cached results."""
         try:
-            # Common mDNS service types to query
-            service_types = [
-                "_http._tcp.local.",
-                "_https._tcp.local.",
-                "_airplay._tcp.local.",
-                "_raop._tcp.local.",
-                "_googlecast._tcp.local.",
-                "_spotify-connect._tcp.local.",
-                "_homekit._tcp.local.",
-                "_hap._tcp.local.",
-                "_printer._tcp.local.",
-                "_ipp._tcp.local.",
-                "_pdl-datastream._tcp.local.",
-                "_scanner._tcp.local.",
-                "_smb._tcp.local.",
-                "_afpovertcp._tcp.local.",
-                "_nfs._tcp.local.",
-                "_ssh._tcp.local.",
-                "_sftp-ssh._tcp.local.",
-                "_device-info._tcp.local.",
-                "_sleep-proxy._udp.local.",
-                "_companion-link._tcp.local.",
-                "_daap._tcp.local.",
-                "_dacp._tcp.local.",
-                "_touch-able._tcp.local.",
-                "_appletv-v2._tcp.local.",
-                "_mediaremotetv._tcp.local.",
-                "_sonos._tcp.local.",
-                "_plex._tcp.local.",
-            ]
-            
-            # Use zeroconf if available, otherwise basic UDP query
-            try:
-                from zeroconf import Zeroconf, ServiceBrowser
-                
-                # Quick mDNS scan
-                zc = Zeroconf()
-                
-                class Listener:
-                    def __init__(self):
-                        self.services = []
-                        
-                    def add_service(self, zc, type_, name):
-                        self.services.append((type_, name))
-                        
-                    def remove_service(self, zc, type_, name):
-                        pass
-                        
-                    def update_service(self, zc, type_, name):
-                        pass
-                
-                listener = Listener()
-                browsers = []
-                
-                for st in service_types:
-                    browser = ServiceBrowser(zc, st, listener)
-                    browsers.append(browser)
-
-                await asyncio.sleep(1.5)  # Wait for responses
-                
-                # Get services for this IP
-                for service_type, name in listener.services:
-                    sinfo = zc.get_service_info(service_type, name, timeout=1000)
-                    if sinfo:
-                        addresses = [socket.inet_ntoa(addr) for addr in sinfo.addresses]
-                        if ip in addresses:
-                            info.mdns_services.append(f"{name} ({service_type})")
+            # Use cached results from bulk scan if available
+            if ip in _zeroconf_services_cache:
+                for service_type, name, sinfo in _zeroconf_services_cache[ip]:
+                    info.mdns_services.append(f"{name} ({service_type})")
+                    
+                    # Extract device info from TXT records
+                    if sinfo and sinfo.properties:
+                        try:
+                            props = {k.decode() if isinstance(k, bytes) else k: 
+                                    v.decode() if isinstance(v, bytes) else v 
+                                    for k, v in sinfo.properties.items()}
                             
-                            # Extract device info from TXT records
-                            if sinfo.properties:
-                                props = {k.decode() if isinstance(k, bytes) else k: 
-                                        v.decode() if isinstance(v, bytes) else v 
-                                        for k, v in sinfo.properties.items()}
-                                
-                                if 'model' in props:
-                                    info.model = props['model']
-                                if 'manufacturer' in props:
-                                    info.manufacturer = props['manufacturer']
-                                if 'md' in props:  # Model for Apple devices
-                                    info.model = props['md']
-                                if 'am' in props:  # Apple Model
-                                    info.model = info.model or props['am']
-                                    
-                            # Get hostname
-                            if sinfo.server and sinfo.server not in info.hostnames:
-                                hostname = sinfo.server.rstrip('.')
-                                if hostname not in info.hostnames:
-                                    info.hostnames.append(hostname)
-                
-                for browser in browsers:
-                    browser.cancel()
-                zc.close()
-                
-            except ImportError:
-                # Fallback: basic mDNS query
-                await self._basic_mdns_query(ip, info)
+                            if 'model' in props:
+                                info.model = props['model']
+                            if 'manufacturer' in props:
+                                info.manufacturer = props['manufacturer']
+                            if 'md' in props:  # Model for Apple devices
+                                info.model = props['md']
+                            if 'am' in props:  # Apple Model
+                                info.model = info.model or props['am']
+                        except Exception:
+                            pass
+                            
+                    # Get hostname
+                    if sinfo and sinfo.server:
+                        hostname = sinfo.server.rstrip('.')
+                        if hostname and hostname not in info.hostnames:
+                            info.hostnames.append(hostname)
+                return
+            
+            # Fallback: basic mDNS query for single device (if not using bulk scan)
+            await self._basic_mdns_query(ip, info)
                 
         except Exception as e:
-            print(f"mDNS error for {ip}: {e}")
+            # Silently ignore mDNS errors to avoid log spam
+            pass
     
     async def _basic_mdns_query(self, ip: str, info: EnhancedDeviceInfo):
         """Basic mDNS query without zeroconf library."""
