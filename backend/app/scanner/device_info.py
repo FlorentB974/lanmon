@@ -10,16 +10,27 @@ Enhanced device information discovery using multiple protocols:
 """
 
 import asyncio
+import logging
 import socket
 import struct
 import re
 import xml.etree.ElementTree as ET
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Set
 from dataclasses import dataclass, field
 from datetime import datetime
 import aiohttp
 import json
 import threading
+
+logger = logging.getLogger(__name__)
+
+# Import Avahi scanner for mDNS discovery
+try:
+    from .avahi_scanner import avahi_scanner, AvahiScanner, AvahiDeviceInfo
+    AVAHI_AVAILABLE = AvahiScanner.is_available()
+except ImportError:
+    AVAHI_AVAILABLE = False
+    avahi_scanner = None
 
 # mDNS/DNS-SD constants
 MDNS_ADDR = "224.0.0.251"
@@ -201,28 +212,38 @@ class DeviceInfoScanner:
     def __init__(self, timeout: float = 2.0):
         self.timeout = timeout
         
-    async def get_device_info(self, ip: str, mac: Optional[str] = None) -> EnhancedDeviceInfo:
+    async def get_device_info(self, ip: str, mac: Optional[str] = None, 
+                              avahi_info: Optional['AvahiDeviceInfo'] = None) -> EnhancedDeviceInfo:
         """
         Gather comprehensive device information using all available methods.
         
         Args:
             ip: Device IP address
             mac: Optional MAC address (for vendor lookup)
+            avahi_info: Optional pre-fetched Avahi device info
             
         Returns:
             EnhancedDeviceInfo with all discovered information
         """
         info = EnhancedDeviceInfo(ip_address=ip, mac_address=mac)
         
+        # If we have Avahi info, use it first (it's usually the best source)
+        if avahi_info:
+            self._apply_avahi_info(avahi_info, info)
+        
         # Run all discovery methods in parallel
         tasks = [
             self._resolve_dns(ip, info),
             self._scan_ports(ip, info),
-            self._probe_mdns(ip, info),
             self._probe_ssdp(ip, info),
             self._probe_netbios(ip, info),
             self._probe_http(ip, info),
         ]
+        
+        # Only probe mDNS if we didn't get Avahi data
+        if not avahi_info:
+            tasks.append(self._probe_mdns(ip, info))
+        
         # Protect the loop from long hangs by bounding total time
         try:
             await asyncio.wait_for(
@@ -238,6 +259,37 @@ class DeviceInfoScanner:
             
         return info
     
+    def _apply_avahi_info(self, avahi_info: 'AvahiDeviceInfo', info: EnhancedDeviceInfo):
+        """Apply Avahi-discovered information to EnhancedDeviceInfo."""
+        # Add hostnames
+        for hostname in avahi_info.hostnames:
+            if hostname and hostname not in info.hostnames:
+                info.hostnames.append(hostname)
+        
+        # Add friendly service names as potential hostnames
+        friendly_name = avahi_info.friendly_name
+        if friendly_name and friendly_name not in info.hostnames:
+            # Insert at the beginning as it's usually the best name
+            info.hostnames.insert(0, friendly_name)
+        
+        # Add model info
+        if avahi_info.model and not info.model:
+            info.model = avahi_info.model
+        
+        # Add manufacturer
+        if avahi_info.manufacturer and not info.manufacturer:
+            info.manufacturer = avahi_info.manufacturer
+        
+        # Add device type
+        if avahi_info.device_type and not info.device_type:
+            info.device_type = avahi_info.device_type
+        
+        # Add mDNS services
+        for service in avahi_info.services:
+            service_str = f"{service.service_name} ({service.service_type})"
+            if service_str not in info.mdns_services:
+                info.mdns_services.append(service_str)
+    
     async def scan_network_enhanced(self, devices: List[Dict]) -> List[EnhancedDeviceInfo]:
         """
         Scan multiple devices for enhanced information.
@@ -248,14 +300,26 @@ class DeviceInfoScanner:
         Returns:
             List of EnhancedDeviceInfo objects
         """
-        # First, do a single mDNS scan to populate the cache for all devices
-        device_ips = set()
+        # Collect all device IPs
+        device_ips: Set[str] = set()
         for d in devices:
             ip = d.get('ip') or d.get('ip_address')
             if ip:
                 device_ips.add(ip)
         
-        await self._scan_mdns_bulk(device_ips)
+        # Try Avahi scanner first (much more reliable on Linux)
+        avahi_cache: Dict[str, 'AvahiDeviceInfo'] = {}
+        if AVAHI_AVAILABLE and avahi_scanner:
+            try:
+                logger.debug("Using avahi-browse for mDNS discovery...")
+                avahi_cache = await avahi_scanner.scan_all(target_ips=device_ips)
+                logger.info(f"Avahi discovered info for {len(avahi_cache)} devices")
+            except Exception as e:
+                logger.warning(f"Avahi scan failed, falling back to Zeroconf: {e}")
+        
+        # Fall back to Zeroconf bulk scan if Avahi didn't find anything
+        if not avahi_cache:
+            await self._scan_mdns_bulk(device_ips)
         
         # Reduce concurrency to avoid socket exhaustion
         semaphore = asyncio.Semaphore(4)
@@ -264,7 +328,7 @@ class DeviceInfoScanner:
             ip = device.get('ip') or device.get('ip_address')
             mac = device.get('mac') or device.get('mac_address')
             async with semaphore:
-                return await self.get_device_info(ip, mac)
+                return await self.get_device_info(ip, mac, avahi_cache.get(ip))
 
         tasks = [wrapped(d) for d in devices]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -357,7 +421,7 @@ class DeviceInfoScanner:
                     pass
                     
         except Exception as e:
-            print(f"Bulk mDNS scan error: {e}")
+            logger.error(f"Bulk mDNS scan error: {e}")
         finally:
             for browser in browsers:
                 try:
@@ -377,7 +441,7 @@ class DeviceInfoScanner:
         except (socket.herror, socket.gaierror, socket.timeout):
             pass
         except Exception as e:
-            print(f"DNS resolution error for {ip}: {e}")
+            logger.debug(f"DNS resolution error for {ip}: {e}")
 
         # FQDN fallback (sometimes gives iPhone/Android names)
         try:
@@ -508,7 +572,7 @@ class DeviceInfoScanner:
             finally:
                 sock.close()
         except Exception as e:
-            print(f"Basic mDNS error for {ip}: {e}")
+            logger.debug(f"Basic mDNS error for {ip}: {e}")
     
     async def _probe_ssdp(self, ip: str, info: EnhancedDeviceInfo):
         """Query SSDP/UPnP for device information."""
@@ -548,7 +612,7 @@ class DeviceInfoScanner:
             transport.close()
             
         except Exception as e:
-            print(f"SSDP error for {ip}: {e}")
+            logger.debug(f"SSDP error for {ip}: {e}")
     
     async def _fetch_upnp_description(self, url: str, info: EnhancedDeviceInfo):
         """Fetch and parse UPnP device description."""
@@ -637,7 +701,7 @@ class DeviceInfoScanner:
                 sock.close()
                 
         except Exception as e:
-            print(f"NetBIOS error for {ip}: {e}")
+            logger.debug(f"NetBIOS error for {ip}: {e}")
     
     async def _probe_http(self, ip: str, info: EnhancedDeviceInfo):
         """Probe HTTP/HTTPS for web interfaces and device info."""

@@ -15,6 +15,7 @@ from .arp_scanner import ARPScanner, DiscoveredDevice
 from .device_info import DeviceInfoScanner, EnhancedDeviceInfo
 from ..db.models import Device, ScanEvent, ScanSession
 from ..db.database import AsyncSessionLocal
+from ..core.config import settings
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
@@ -22,9 +23,13 @@ from sqlalchemy.orm import selectinload
 class NetworkScanner:
     """Main network scanner orchestrating device discovery and tracking."""
     
-    def __init__(self, scan_interval: int = 60):
-        self.scan_interval = scan_interval
-        self.arp_scanner = ARPScanner()
+    def __init__(self, scan_interval: int = None):
+        self.scan_interval = scan_interval or settings.SCAN_INTERVAL
+        self.offline_grace_scans = settings.OFFLINE_GRACE_SCANS
+        self.arp_scanner = ARPScanner(
+            timeout=settings.SCAN_TIMEOUT, 
+            retries=settings.SCAN_RETRIES
+        )
         self.device_info_scanner = DeviceInfoScanner()
         self._running = False
         self._scan_task: Optional[asyncio.Task] = None
@@ -175,12 +180,45 @@ class NetworkScanner:
                 devices_online = 0
                 devices_new = 0
                 
-                # Set all devices offline first
+                # Handle devices not found in this scan - use grace period
                 current_macs = {d.mac_address for d in discovered}
+                devices_to_verify = []
+                
                 for mac, device in existing_devices.items():
-                    if mac not in current_macs and device.is_online:
+                    if mac not in current_macs:
+                        if device.is_online:
+                            # Device was online but not found in this scan
+                            # Increment missed_scans counter
+                            device.missed_scans = (device.missed_scans or 0) + 1
+                            device.updated_at = datetime.utcnow()
+                            
+                            if device.missed_scans >= self.offline_grace_scans:
+                                # Device has been missing for multiple scans, verify before marking offline
+                                devices_to_verify.append(device)
+                            else:
+                                print(f"  ⚠️ {device.ip_address}: {device.hostname or device.mac_address} - not seen ({device.missed_scans}/{self.offline_grace_scans})")
+                    else:
+                        # Device was found, reset missed_scans counter
+                        device.missed_scans = 0
+                
+                # Verify devices that have exceeded grace period before marking offline
+                for device in devices_to_verify:
+                    print(f"  🔄 Verifying {device.ip_address} ({device.hostname or device.mac_address})...")
+                    is_still_online = await self.arp_scanner.verify_device_online(
+                        device.ip_address, 
+                        device.mac_address
+                    )
+                    
+                    if is_still_online:
+                        # Device responded to verification, reset counter
+                        device.missed_scans = 0
+                        print(f"  ✓ {device.ip_address}: {device.hostname or device.mac_address} - verified online")
+                    else:
+                        # Device is truly offline
                         device.is_online = False
+                        device.missed_scans = 0
                         device.updated_at = datetime.utcnow()
+                        print(f"  ✗ {device.ip_address}: {device.hostname or device.mac_address} - offline")
                         
                         # Create disconnection event
                         event = ScanEvent(
@@ -216,6 +254,24 @@ class NetworkScanner:
                     elif enhanced and enhanced.vendor:
                         vendor = enhanced.vendor
                     
+                    # Extract manufacturer (separate from vendor)
+                    manufacturer = None
+                    if enhanced and enhanced.manufacturer:
+                        manufacturer = enhanced.manufacturer
+                    
+                    # Extract model
+                    model = None
+                    if enhanced and enhanced.model:
+                        model = enhanced.model
+                    
+                    # Extract friendly name (from Avahi)
+                    friendly_name = None
+                    if enhanced and hasattr(enhanced, 'friendly_name'):
+                        friendly_name = enhanced.friendly_name
+                    elif enhanced and enhanced.hostnames:
+                        # Use the first hostname if no friendly name
+                        friendly_name = enhanced.hostnames[0] if enhanced.hostnames else None
+                    
                     # Determine device type
                     device_type = None
                     if enhanced:
@@ -227,6 +283,13 @@ class NetworkScanner:
                         import json
                         open_ports_str = json.dumps(enhanced.open_ports)
                     
+                    # Get services as JSON string
+                    services_str = None
+                    if enhanced and enhanced.mdns_services:
+                        import json
+                        # Keep only first 10 services to avoid huge strings
+                        services_str = json.dumps(enhanced.mdns_services[:10])
+                    
                     if disc_device.mac_address in existing_devices:
                         # Update existing device
                         device = existing_devices[disc_device.mac_address]
@@ -235,6 +298,7 @@ class NetworkScanner:
                         
                         device.ip_address = disc_device.ip_address
                         device.is_online = True
+                        device.missed_scans = 0  # Reset missed scans counter
                         device.last_seen = datetime.utcnow()
                         device.updated_at = datetime.utcnow()
                         
@@ -242,9 +306,21 @@ class NetworkScanner:
                         if hostname and (not device.hostname or device.hostname.endswith('.local')):
                             device.hostname = hostname
                         
-                        # Update vendor if missing
+                        # Update vendor if missing or if we have manufacturer info
                         if vendor and not device.vendor:
                             device.vendor = vendor
+                        
+                        # Update manufacturer
+                        if manufacturer:
+                            device.manufacturer = manufacturer
+                        
+                        # Update model
+                        if model:
+                            device.model = model
+                        
+                        # Update friendly name if we found one
+                        if friendly_name and not device.friendly_name:
+                            device.friendly_name = friendly_name
                         
                         # Update device type if we detected one
                         if device_type and not device.device_type:
@@ -253,6 +329,10 @@ class NetworkScanner:
                         # Update open ports
                         if open_ports_str:
                             device.open_ports = open_ports_str
+                        
+                        # Update services
+                        if services_str:
+                            device.services = services_str
                         
                         # Create events
                         if not was_online:
@@ -297,10 +377,15 @@ class NetworkScanner:
                             ip_address=disc_device.ip_address,
                             hostname=hostname,
                             vendor=vendor,
+                            manufacturer=manufacturer,
+                            model=model,
+                            friendly_name=friendly_name,
                             device_type=device_type,
                             open_ports=open_ports_str,
+                            services=services_str,
                             is_online=True,
                             is_known=False,  # New device starts as unknown
+                            missed_scans=0,
                             first_seen=datetime.utcnow(),
                             last_seen=datetime.utcnow()
                         )

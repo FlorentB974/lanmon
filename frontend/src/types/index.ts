@@ -16,6 +16,10 @@ export interface Device {
   updated_at: string;
   open_ports: string | null;
   network_interface: string | null;
+  model: string | null;
+  manufacturer: string | null;
+  friendly_name: string | null;
+  services: string | null;
 }
 
 export interface DeviceListResponse {

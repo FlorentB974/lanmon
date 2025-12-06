@@ -9,9 +9,13 @@ class DeviceBase(BaseModel):
     ip_address: Optional[str] = None
     hostname: Optional[str] = None
     vendor: Optional[str] = None
+    manufacturer: Optional[str] = None
     device_type: Optional[str] = None
+    model: Optional[str] = None
+    friendly_name: Optional[str] = None
     custom_name: Optional[str] = None
     notes: Optional[str] = None
+    services: Optional[str] = None
 
 
 class DeviceResponse(DeviceBase):
@@ -28,6 +32,10 @@ class DeviceResponse(DeviceBase):
     updated_at: datetime
     open_ports: Optional[str] = None
     network_interface: Optional[str] = None
+    manufacturer: Optional[str] = None
+    model: Optional[str] = None
+    friendly_name: Optional[str] = None
+    services: Optional[str] = None
 
 
 class DeviceUpdate(BaseModel):

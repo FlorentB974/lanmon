@@ -612,14 +612,15 @@ class DiscoveredDevice:
 class ARPScanner:
     """ARP-based network scanner for device discovery."""
     
-    def __init__(self, timeout: int = 3):
+    def __init__(self, timeout: int = 5, retries: int = 2):
         self.timeout = timeout
+        self.retries = retries  # Number of ARP scan attempts
         if SCAPY_AVAILABLE:
             conf.verb = 0  # Disable scapy verbose output
     
     async def scan_subnet(self, subnet: str) -> list[DiscoveredDevice]:
         """
-        Scan a subnet for devices using ARP.
+        Scan a subnet for devices using multiple methods for comprehensive discovery.
         
         Args:
             subnet: Network subnet in CIDR notation (e.g., "192.168.1.0/24")
@@ -627,10 +628,152 @@ class ARPScanner:
         Returns:
             List of discovered devices
         """
+        all_devices = {}  # MAC -> Device mapping to deduplicate
+        
+        # Method 1: ARP scan with scapy (multiple attempts)
         if SCAPY_AVAILABLE:
-            return await self._scan_with_scapy(subnet)
-        else:
-            return await self._scan_with_arp_scan(subnet)
+            for attempt in range(self.retries):
+                try:
+                    scapy_devices = await self._scan_with_scapy(subnet)
+                    for device in scapy_devices:
+                        if device.mac_address not in all_devices:
+                            all_devices[device.mac_address] = device
+                except Exception as e:
+                    print(f"Scapy scan attempt {attempt + 1} error: {e}")
+                
+                # Small delay between attempts
+                if attempt < self.retries - 1:
+                    await asyncio.sleep(0.5)
+        
+        # Method 2: arp-scan command line tool
+        try:
+            arp_scan_devices = await self._scan_with_arp_scan(subnet)
+            for device in arp_scan_devices:
+                if device.mac_address not in all_devices:
+                    all_devices[device.mac_address] = device
+        except Exception as e:
+            print(f"arp-scan error: {e}")
+        
+        # Method 3: System ARP table (includes recently active devices)
+        try:
+            arp_table_devices = await self._get_arp_table()
+            for device in arp_table_devices:
+                if device.mac_address not in all_devices:
+                    all_devices[device.mac_address] = device
+        except Exception as e:
+            print(f"ARP table error: {e}")
+        
+        # Method 4: Ping sweep to populate ARP table, then re-read
+        try:
+            await self._ping_sweep(subnet)
+            arp_table_after_ping = await self._get_arp_table()
+            for device in arp_table_after_ping:
+                if device.mac_address not in all_devices:
+                    all_devices[device.mac_address] = device
+        except Exception as e:
+            print(f"Ping sweep error: {e}")
+        
+        return list(all_devices.values())
+    
+    async def _ping_sweep(self, subnet: str) -> None:
+        """Perform a quick ping sweep to populate ARP cache."""
+        import ipaddress
+        
+        try:
+            network = ipaddress.ip_network(subnet, strict=False)
+            hosts = list(network.hosts())
+            
+            # Limit to first 254 hosts for performance
+            hosts = hosts[:254]
+            
+            # Ping in batches to avoid overwhelming the network
+            batch_size = 50
+            for i in range(0, len(hosts), batch_size):
+                batch = hosts[i:i + batch_size]
+                tasks = []
+                for host in batch:
+                    tasks.append(self._ping_host(str(host)))
+                
+                # Wait for batch with timeout
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=3.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                    
+        except Exception as e:
+            print(f"Ping sweep error: {e}")
+    
+    async def _ping_host(self, ip: str) -> bool:
+        """Ping a single host."""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ping", "-c", "1", "-W", "1", ip,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await process.wait()
+            return process.returncode == 0
+        except Exception:
+            return False
+    
+    async def verify_device_online(self, ip: str, mac: str = None) -> bool:
+        """
+        Verify if a specific device is online using multiple methods.
+        Used to double-check before marking a device offline.
+        """
+        # Method 1: Ping
+        if await self._ping_host(ip):
+            return True
+        
+        # Method 2: ARP probe for specific IP
+        if SCAPY_AVAILABLE:
+            try:
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, self._arp_probe, ip
+                )
+                if result:
+                    # If mac is provided, verify it matches
+                    if mac and result.lower() != mac.lower():
+                        return False  # Different device on this IP
+                    return True
+            except Exception:
+                pass
+        
+        # Method 3: Check ARP table
+        try:
+            arp_devices = await self._get_arp_table()
+            for device in arp_devices:
+                if device.ip_address == ip:
+                    if mac and device.mac_address.lower() != mac.lower():
+                        return False  # Different device
+                    return True
+        except Exception:
+            pass
+        
+        return False
+    
+    def _arp_probe(self, ip: str) -> Optional[str]:
+        """Send ARP probe to specific IP and return MAC if found."""
+        if not SCAPY_AVAILABLE:
+            return None
+        
+        try:
+            arp = ARP(pdst=ip)
+            ether = Ether(dst="ff:ff:ff:ff:ff:ff")
+            packet = ether / arp
+            
+            result = srp(packet, timeout=2, verbose=False, retry=2)[0]
+            
+            if result:
+                return result[0][1].hwsrc.lower()
+        except Exception:
+            pass
+        
+        return None
     
     async def _scan_with_scapy(self, subnet: str) -> list[DiscoveredDevice]:
         """Scan using scapy library."""
@@ -645,8 +788,6 @@ class ARPScanner:
             devices = result
         except Exception as e:
             print(f"Scapy scan error: {e}")
-            # Fallback to arp-scan
-            devices = await self._scan_with_arp_scan(subnet)
         
         return devices
     
@@ -660,9 +801,9 @@ class ARPScanner:
             ether = Ether(dst="ff:ff:ff:ff:ff:ff")
             packet = ether / arp
             
-            # Send and receive
+            # Send and receive with increased timeout and retry
             start_time = datetime.now()
-            result = srp(packet, timeout=self.timeout, verbose=False)[0]
+            result = srp(packet, timeout=self.timeout, verbose=False, retry=2)[0]
             
             for sent, received in result:
                 response_time = (datetime.now() - start_time).total_seconds() * 1000

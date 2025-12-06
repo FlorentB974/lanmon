@@ -15,12 +15,14 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite+aiosqlite:///./lanmon.db"
     
     # Network Scanning
-    SCAN_INTERVAL: int = 60  # seconds
-    SCAN_TIMEOUT: int = 10  # seconds per host
+    SCAN_INTERVAL: int = 120  # seconds
+    SCAN_TIMEOUT: int = 5  # seconds per host for ARP responses
+    SCAN_RETRIES: int = 2  # number of ARP scan attempts
+    OFFLINE_GRACE_SCANS: int = 3  # missed scans before marking device offline
     DEFAULT_SUBNET: Optional[str] = None  # Auto-detect if None
     
     # CORS
-    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    CORS_ORIGINS: list[str] = ["*"]
     
     class Config:
         env_file = ".env"

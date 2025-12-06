@@ -14,14 +14,19 @@ class Device(Base):
     ip_address = Column(String(45), index=True)  # IPv6 compatible
     hostname = Column(String(255))
     vendor = Column(String(255))
+    manufacturer = Column(String(255))  # Device manufacturer (from mDNS)
     device_type = Column(String(100))  # router, computer, phone, iot, etc.
+    model = Column(String(255))  # Device model (e.g., MacBookPro18,3, AppleTV6,2)
+    friendly_name = Column(String(255))  # User-friendly name from mDNS
     custom_name = Column(String(255))
     notes = Column(Text)
+    services = Column(Text)  # JSON string of discovered services
     
     # Status
     is_online = Column(Boolean, default=False)
     is_favorite = Column(Boolean, default=False)
     is_known = Column(Boolean, default=True)  # Known vs unknown/new device
+    missed_scans = Column(Integer, default=0)  # Number of consecutive scans where device was not seen
     
     # Timestamps
     first_seen = Column(DateTime, default=datetime.utcnow)

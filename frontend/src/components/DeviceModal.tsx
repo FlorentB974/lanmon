@@ -227,7 +227,7 @@ export default function DeviceModal({ device, onClose, onUpdate }: DeviceModalPr
             <div className="flex-1">
               <div className="flex items-center gap-2">
                 <h2 className="text-xl font-bold text-white">
-                  {device.custom_name || device.hostname || formatMacAddress(device.mac_address)}
+                  {device.custom_name || device.friendly_name || device.hostname || formatMacAddress(device.mac_address)}
                 </h2>
                 {device.is_online ? (
                   <span className="flex items-center gap-1 px-2 py-0.5 bg-emerald-500/20 text-emerald-400 text-xs rounded-full">
@@ -246,8 +246,8 @@ export default function DeviceModal({ device, onClose, onUpdate }: DeviceModalPr
                 {device.ip_address || "No IP"}
               </p>
               
-              {device.vendor && (
-                <p className="text-sm text-slate-500 mt-1">{device.vendor}</p>
+              {(device.manufacturer || device.vendor) && (
+                <p className="text-sm text-slate-500 mt-1">{device.manufacturer || device.vendor}</p>
               )}
             </div>
 
@@ -293,6 +293,24 @@ export default function DeviceModal({ device, onClose, onUpdate }: DeviceModalPr
               <p className="text-xs text-slate-500 uppercase tracking-wider">IP Address</p>
               <p className="font-mono text-white mt-1">{device.ip_address || "—"}</p>
             </div>
+            {device.model && (
+              <div className="p-3 bg-surface-800/50 rounded-lg">
+                <p className="text-xs text-slate-500 uppercase tracking-wider">Model</p>
+                <p className="text-white mt-1">{device.model}</p>
+              </div>
+            )}
+            {device.manufacturer && (
+              <div className="p-3 bg-surface-800/50 rounded-lg">
+                <p className="text-xs text-slate-500 uppercase tracking-wider">Manufacturer</p>
+                <p className="text-white mt-1">{device.manufacturer}</p>
+              </div>
+            )}
+            {device.friendly_name && device.friendly_name !== device.hostname && (
+              <div className="p-3 bg-surface-800/50 rounded-lg">
+                <p className="text-xs text-slate-500 uppercase tracking-wider">Friendly Name</p>
+                <p className="text-white mt-1">{device.friendly_name}</p>
+              </div>
+            )}
             <div className="p-3 bg-surface-800/50 rounded-lg">
               <p className="text-xs text-slate-500 uppercase tracking-wider flex items-center gap-1">
                 <Calendar className="w-3 h-3" /> First Seen
@@ -337,6 +355,45 @@ export default function DeviceModal({ device, onClose, onUpdate }: DeviceModalPr
                       </div>
                     );
                   })}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* mDNS Services Section */}
+          {(() => {
+            if (!device.services) return null;
+            
+            let services: string[] = [];
+            try {
+              const parsed = JSON.parse(device.services);
+              services = Array.isArray(parsed) ? parsed : [];
+            } catch {
+              services = [];
+            }
+            
+            if (services.length === 0) return null;
+            
+            return (
+              <div className="mb-6">
+                <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                  <Server className="w-4 h-4" />
+                  Discovered Services ({services.length})
+                </h3>
+                <div className="space-y-2">
+                  {services.slice(0, 10).map((service, idx) => (
+                    <div
+                      key={idx}
+                      className="p-2 bg-surface-800/50 rounded-lg text-sm text-slate-300 font-mono text-xs"
+                    >
+                      {service}
+                    </div>
+                  ))}
+                  {services.length > 10 && (
+                    <p className="text-xs text-slate-500 text-center pt-2">
+                      +{services.length - 10} more services
+                    </p>
+                  )}
                 </div>
               </div>
             );

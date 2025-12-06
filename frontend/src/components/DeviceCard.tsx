@@ -81,7 +81,8 @@ export default function DeviceCard({ device, onClick, index }: DeviceCardProps) 
   const iconKey = getDeviceIcon(device);
   const Icon = iconMap[iconKey] || HelpCircle;
   
-  const displayName = device.custom_name || device.hostname || formatMacAddress(device.mac_address);
+  // Prefer: custom_name > friendly_name > hostname > MAC address
+  const displayName = device.custom_name || device.friendly_name || device.hostname || formatMacAddress(device.mac_address);
   const openPorts = parseOpenPorts(device.open_ports);
 
   return (
@@ -138,7 +139,7 @@ export default function DeviceCard({ device, onClick, index }: DeviceCardProps) 
             )}
           </div>
           
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             {device.ip_address && (
               <p className="text-sm text-slate-400 font-mono">
                 {device.ip_address}
@@ -151,9 +152,13 @@ export default function DeviceCard({ device, onClick, index }: DeviceCardProps) 
             )}
           </div>
           
-          {device.vendor && (
+          {(device.model || device.manufacturer || device.vendor) && (
             <p className="text-xs text-slate-500 truncate mt-1">
-              {device.vendor}
+              {device.model && (
+                <span className="font-medium text-slate-400">{device.model}</span>
+              )}
+              {device.model && (device.manufacturer || device.vendor) && " · "}
+              {device.manufacturer || device.vendor}
             </p>
           )}
         </div>
