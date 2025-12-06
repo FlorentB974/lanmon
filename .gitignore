@@ -1,0 +1,128 @@
+# Root .gitignore for lanmon monorepo
+
+# -------------------------
+# macOS
+# -------------------------
+.DS_Store
+.AppleDouble
+.Spotlight-V100
+
+# Thumbnails
+._*
+
+# Icon file
+Icon?
+
+# -------------------------
+# Node / Frontend
+# -------------------------
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.parcel-cache/
+frontend/.vercel/
+.next/standalone
+.next/static
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Yarn v2/v3
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+
+# -------------------------
+# Python / Backend
+# -------------------------
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+
+# Virtual environments
+backend/.venv/
+backend/venv/
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage/
+nosetests.xml
+coverage.xml
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MyPy / Pyre
+.mypy_cache/
+.pyre/
+
+# -------------------------
+# Database and local data
+# -------------------------
+# Ignore runtime DB files and local data directories
+*.db*
+*.sqlite
+*.sqlite3
+backend/data/
+data/
+
+# -------------------------
+# Environment files
+# -------------------------
+# Local env files (may contain secrets)
+.env
+.env.*.local
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# -------------------------
+# IDEs and editors
+# -------------------------
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# System files
+Thumbs.db
+ehthumbs.db
+*.swp
+*~
+
+# Docker
+docker-compose.override.yml
+.dockerignore
+
+# Misc
+.cache/
+.python-eggs/
+
+# Allow the user to intentionally keep an otherwise-ignored directory
+!.gitkeep
