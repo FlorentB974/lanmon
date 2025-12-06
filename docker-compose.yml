@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: lanmon-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./data/lanmon.db
+      - SCAN_INTERVAL=60
+    volumes:
+      - ./data:/app/data
+    # Network scanning requires special privileges
+    # NOTE: On macOS/Windows, Docker runs in a VM so network scanning won't work.
+    # For full LAN scanning on macOS/Windows, run the backend natively.
+    # On Linux, uncomment the next line for host network access:
+    # network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:8000
+    container_name: lanmon-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
