@@ -30,6 +30,7 @@ import {
   Globe,
   Lock,
   Server,
+  AlertCircle,
 } from "lucide-react";
 import { Device, ScanEvent } from "@/types";
 import { api } from "@/lib/api";
@@ -105,11 +106,13 @@ interface DeviceModalProps {
   device: Device;
   onClose: () => void;
   onUpdate: (device: Device) => void;
+  onDelete?: (deviceId: number) => void;
 }
 
-export default function DeviceModal({ device, onClose, onUpdate }: DeviceModalProps) {
+export default function DeviceModal({ device, onClose, onUpdate, onDelete }: DeviceModalProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [events, setEvents] = useState<ScanEvent[]>([]);
   const [loading, setLoading] = useState(false);
   
@@ -169,6 +172,23 @@ export default function DeviceModal({ device, onClose, onUpdate }: DeviceModalPr
       onUpdate(updated);
     } catch (error) {
       console.error("Failed to mark as known:", error);
+    }
+  };
+
+  const handleDelete = async () => {
+    setLoading(true);
+    try {
+      await api.deleteDevice(device.id);
+      if (onDelete) {
+        onDelete(device.id);
+      }
+      onClose();
+    } catch (error) {
+      console.error("Failed to delete device:", error);
+      alert("Failed to delete device. Please try again.");
+    } finally {
+      setLoading(false);
+      setShowDeleteConfirm(false);
     }
   };
 
@@ -455,13 +475,22 @@ export default function DeviceModal({ device, onClose, onUpdate }: DeviceModalPr
               </div>
             </div>
           ) : (
-            <button
-              onClick={() => setIsEditing(true)}
-              className="flex items-center gap-2 px-4 py-2 bg-surface-800/50 hover:bg-surface-700 text-slate-300 rounded-lg transition-colors mb-6"
-            >
-              <Edit3 className="w-4 h-4" />
-              Edit Device
-            </button>
+            <div className="flex gap-2 mb-6">
+              <button
+                onClick={() => setIsEditing(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-surface-800/50 hover:bg-surface-700 text-slate-300 rounded-lg transition-colors"
+              >
+                <Edit3 className="w-4 h-4" />
+                Edit Device
+              </button>
+              <button
+                onClick={() => setShowDeleteConfirm(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg transition-colors"
+              >
+                <Trash2 className="w-4 h-4" />
+                Delete Device
+              </button>
+            </div>
           )}
 
           {/* Notes display */}
@@ -520,6 +549,42 @@ export default function DeviceModal({ device, onClose, onUpdate }: DeviceModalPr
             )}
           </div>
         </div>
+
+        {/* Delete Confirmation Dialog */}
+        {showDeleteConfirm && (
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-6 rounded-2xl">
+            <div className="bg-surface-900 border border-red-500/30 rounded-xl p-6 max-w-md">
+              <div className="flex items-start gap-3 mb-4">
+                <div className="w-10 h-10 rounded-lg bg-red-500/20 flex items-center justify-center flex-shrink-0">
+                  <AlertCircle className="w-5 h-5 text-red-400" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-white mb-1">Delete Device?</h3>
+                  <p className="text-sm text-slate-400">
+                    Are you sure you want to delete <strong className="text-white">{device.custom_name || device.hostname || formatMacAddress(device.mac_address)}</strong>? This will remove all device data and history.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2 justify-end">
+                <button
+                  onClick={() => setShowDeleteConfirm(false)}
+                  disabled={loading}
+                  className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleDelete}
+                  disabled={loading}
+                  className="flex items-center gap-2 px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg transition-colors disabled:opacity-50"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  {loading ? "Deleting..." : "Delete"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </motion.div>
     </motion.div>
   );

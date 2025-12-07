@@ -305,6 +305,11 @@ export default function Home() {
               setDevices(devices.map(d => d.id === updated.id ? updated : d));
               setSelectedDevice(updated);
             }}
+            onDelete={(deviceId) => {
+              setDevices(devices.filter(d => d.id !== deviceId));
+              setSelectedDevice(null);
+              fetchData(); // Refresh stats after deletion
+            }}
           />
         )}
       </AnimatePresence>
