@@ -307,12 +307,20 @@ class DeviceInfoScanner:
             if ip:
                 device_ips.add(ip)
         
+        # IMPORTANT: Only scan the devices we were given, don't discover new ones
+        print(f"📋 Deep scan will check {len(device_ips)} devices: {sorted(list(device_ips))}")
+        
         # Try Avahi scanner first (much more reliable on Linux)
         avahi_cache: Dict[str, 'AvahiDeviceInfo'] = {}
         if AVAHI_AVAILABLE and avahi_scanner:
             try:
                 logger.debug("Using avahi-browse for mDNS discovery...")
                 avahi_cache = await avahi_scanner.scan_all(target_ips=device_ips)
+                
+                # STRICT FILTER: Only keep devices that were in our original list
+                filtered_avahi = {ip: info for ip, info in avahi_cache.items() if ip in device_ips}
+                avahi_cache = filtered_avahi
+                
                 logger.info(f"Avahi discovered info for {len(avahi_cache)} devices")
             except Exception as e:
                 logger.warning(f"Avahi scan failed, falling back to Zeroconf: {e}")
@@ -333,10 +341,16 @@ class DeviceInfoScanner:
         tasks = [wrapped(d) for d in devices]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
+        # Filter results to only include valid EnhancedDeviceInfo for requested IPs
+        valid_results = []
+        for result in results:
+            if isinstance(result, EnhancedDeviceInfo) and result.ip_address in device_ips:
+                valid_results.append(result)
+        
         # Clean up after scan
         _close_zeroconf()
         
-        return results
+        return valid_results
     
     async def _scan_mdns_bulk(self, ips: set):
         """

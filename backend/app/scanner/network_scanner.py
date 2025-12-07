@@ -157,6 +157,11 @@ class NetworkScanner:
                 # Perform ARP scan
                 discovered = await self.arp_scanner.scan_subnet(subnet)
                 
+                # DEBUG: Log discovered IPs
+                print(f"📡 ARP scanner discovered {len(discovered)} devices:")
+                for d in discovered:
+                    print(f"   - {d.ip_address} ({d.mac_address})")
+                
                 # Perform enhanced device info gathering for all discovered devices
                 enhanced_info_map = {}
                 if deep_scan and discovered:

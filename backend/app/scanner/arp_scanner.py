@@ -628,6 +628,11 @@ class ARPScanner:
         Returns:
             List of discovered devices
         """
+        import ipaddress
+        
+        # Parse the target network for filtering
+        target_network = ipaddress.ip_network(subnet, strict=False)
+        
         all_devices = {}  # MAC -> Device mapping to deduplicate
         
         # Method 1: ARP scan with scapy (multiple attempts)
@@ -654,26 +659,52 @@ class ARPScanner:
         except Exception as e:
             print(f"arp-scan error: {e}")
         
-        # Method 3: System ARP table (includes recently active devices)
+        # Method 3: System ARP table (includes recently active devices) - FILTERED by subnet
         try:
             arp_table_devices = await self._get_arp_table()
             for device in arp_table_devices:
-                if device.mac_address not in all_devices:
-                    all_devices[device.mac_address] = device
+                # Only include devices in the target subnet
+                try:
+                    device_ip = ipaddress.ip_address(device.ip_address)
+                    if device_ip in target_network and device.mac_address not in all_devices:
+                        all_devices[device.mac_address] = device
+                except ValueError:
+                    # Invalid IP address, skip
+                    pass
         except Exception as e:
             print(f"ARP table error: {e}")
         
-        # Method 4: Ping sweep to populate ARP table, then re-read
+        # Method 4: Ping sweep to populate ARP table, then re-read - FILTERED by subnet
         try:
             await self._ping_sweep(subnet)
             arp_table_after_ping = await self._get_arp_table()
             for device in arp_table_after_ping:
-                if device.mac_address not in all_devices:
-                    all_devices[device.mac_address] = device
+                # Only include devices in the target subnet
+                try:
+                    device_ip = ipaddress.ip_address(device.ip_address)
+                    if device_ip in target_network and device.mac_address not in all_devices:
+                        all_devices[device.mac_address] = device
+                except ValueError:
+                    # Invalid IP address, skip
+                    pass
         except Exception as e:
             print(f"Ping sweep error: {e}")
         
-        return list(all_devices.values())
+        # FINAL FILTER: Remove any devices not in the target subnet
+        filtered_devices = []
+        for device in all_devices.values():
+            try:
+                device_ip = ipaddress.ip_address(device.ip_address)
+                if device_ip in target_network:
+                    filtered_devices.append(device)
+                else:
+                    print(f"  ⚠️ Filtering out {device.ip_address} (not in {subnet})")
+            except ValueError:
+                # Invalid IP, skip
+                pass
+        
+        print(f"  ✅ Filtered to {len(filtered_devices)} devices in subnet {subnet}")
+        return filtered_devices
     
     async def _ping_sweep(self, subnet: str) -> None:
         """Perform a quick ping sweep to populate ARP cache."""
@@ -835,9 +866,9 @@ class ARPScanner:
         devices = []
         
         try:
-            # Run arp-scan command
+            # Run arp-scan command with SPECIFIC subnet, not --localnet
             process = await asyncio.create_subprocess_exec(
-                "arp-scan", "--localnet", "-q",
+                "arp-scan", subnet, "-q",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
