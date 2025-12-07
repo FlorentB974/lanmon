@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_serializer
 from datetime import datetime
 from typing import Optional
 
@@ -37,6 +37,17 @@ class DeviceResponse(DeviceBase):
     friendly_name: Optional[str] = None
     services: Optional[str] = None
 
+    @field_serializer('first_seen', 'last_seen', 'created_at', 'updated_at')
+    def serialize_datetime(self, dt: datetime, _info) -> str:
+        """Serialize datetime to ISO 8601 format with timezone."""
+        if dt:
+            # Ensure timezone-aware, add Z suffix for UTC
+            if dt.tzinfo is None:
+                # If somehow a naive datetime got through, treat it as UTC
+                return dt.isoformat() + 'Z'
+            return dt.isoformat().replace('+00:00', 'Z')
+        return None
+
 
 class DeviceUpdate(BaseModel):
     """Device update schema."""
@@ -68,6 +79,15 @@ class ScanEventResponse(BaseModel):
     response_time: Optional[float] = None
     scan_method: Optional[str] = None
 
+    @field_serializer('timestamp')
+    def serialize_datetime(self, dt: datetime, _info) -> str:
+        """Serialize datetime to ISO 8601 format with timezone."""
+        if dt:
+            if dt.tzinfo is None:
+                return dt.isoformat() + 'Z'
+            return dt.isoformat().replace('+00:00', 'Z')
+        return None
+
 
 class ScanSessionResponse(BaseModel):
     """Scan session response schema."""
@@ -83,6 +103,15 @@ class ScanSessionResponse(BaseModel):
     subnet: Optional[str] = None
     scan_method: Optional[str] = None
     error_message: Optional[str] = None
+
+    @field_serializer('started_at', 'completed_at')
+    def serialize_datetime(self, dt: datetime, _info) -> str:
+        """Serialize datetime to ISO 8601 format with timezone."""
+        if dt:
+            if dt.tzinfo is None:
+                return dt.isoformat() + 'Z'
+            return dt.isoformat().replace('+00:00', 'Z')
+        return None
 
 
 class ScanTriggerResponse(BaseModel):
@@ -105,3 +134,12 @@ class DashboardStats(BaseModel):
     active_last_24h: int
     events_last_24h: int
     last_scan_time: Optional[datetime] = None
+
+    @field_serializer('last_scan_time')
+    def serialize_datetime(self, dt: datetime, _info) -> str:
+        """Serialize datetime to ISO 8601 format with timezone."""
+        if dt:
+            if dt.tzinfo is None:
+                return dt.isoformat() + 'Z'
+            return dt.isoformat().replace('+00:00', 'Z')
+        return None
