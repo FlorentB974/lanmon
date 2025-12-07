@@ -18,6 +18,7 @@ from ..db.database import AsyncSessionLocal
 from ..core.config import settings
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
+from datetime import timedelta
 
 
 class NetworkScanner:
@@ -34,6 +35,66 @@ class NetworkScanner:
         self._running = False
         self._scan_task: Optional[asyncio.Task] = None
         self._websocket_callbacks = []
+        
+        # Deep scan optimization settings
+        self.deep_scan_interval_hours = settings.DEEP_SCAN_PERIODIC_REFRESH_DAYS * 24
+        self.recent_update_threshold_hours = settings.DEEP_SCAN_COMPLETE_INFO_SKIP_HOURS
+    
+    def _should_deep_scan_device(self, device: Device) -> bool:
+        """
+        Determine if a device needs a deep scan based on information completeness.
+        
+        Criteria for skipping deep scan:
+        - Device is marked as known (is_known=True) - user has acknowledged it
+        - Device has complete information (hostname, vendor/manufacturer, device_type, model, services, open_ports)
+        - Device was updated recently (within last 24 hours)
+        
+        Always deep scan:
+        - New/unknown devices (is_known=False)
+        - Devices with incomplete information
+        - Devices not scanned in the last 7 days (periodic refresh)
+        """
+        # Always scan new/unknown devices
+        if not device.is_known:
+            return True
+        
+        # If device is known (marked by user), treat it as complete and check timing
+        # This allows users to skip deep scans on devices they've acknowledged
+        if device.updated_at:
+            now = datetime.now(timezone.utc)
+            
+            # Ensure device.updated_at is timezone-aware for comparison
+            updated_at = device.updated_at
+            if updated_at.tzinfo is None:
+                # If naive datetime, assume it's UTC
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            
+            time_since_update = now - updated_at
+            
+            # Skip scan if updated recently (within threshold)
+            if time_since_update < timedelta(hours=self.recent_update_threshold_hours):
+                return False
+            
+            # Force deep scan if not scanned in a long time (periodic refresh)
+            if time_since_update > timedelta(hours=self.deep_scan_interval_hours):
+                return True
+        
+        # For known devices without recent updates, still check if info is complete
+        has_name = bool(device.hostname or device.friendly_name)
+        has_vendor = bool(device.vendor or device.manufacturer)
+        has_type = bool(device.device_type)
+        has_model = bool(device.model)
+        has_services = bool(device.services)
+        has_ports = bool(device.open_ports)
+        
+        is_complete = has_name and has_vendor and has_type and has_model and has_services and has_ports
+        
+        # If device is incomplete, scan it
+        if not is_complete:
+            return True
+        
+        # Default: skip deep scan for known devices with complete info
+        return False
     
     def register_callback(self, callback):
         """Register a callback for scan updates."""
@@ -162,15 +223,35 @@ class NetworkScanner:
                 for d in discovered:
                     print(f"   - {d.ip_address} ({d.mac_address})")
                 
-                # Perform enhanced device info gathering for all discovered devices
-                enhanced_info_map = {}
+                # Get all existing devices to determine which need deep scanning
+                result = await session.execute(select(Device))
+                existing_devices = {d.mac_address: d for d in result.scalars().all()}
+                
+                # Determine which devices need deep scanning
+                devices_needing_deep_scan = []
                 if deep_scan and discovered:
-                    print(f"🔍 Performing deep scan on {len(discovered)} devices...")
+                    for disc_device in discovered:
+                        existing_device = existing_devices.get(disc_device.mac_address)
+                        if existing_device is None or self._should_deep_scan_device(existing_device):
+                            devices_needing_deep_scan.append(disc_device)
+                    
+                    if devices_needing_deep_scan:
+                        print(f"🔍 Performing deep scan on {len(devices_needing_deep_scan)}/{len(discovered)} devices...")
+                        skipped_count = len(discovered) - len(devices_needing_deep_scan)
+                        if skipped_count > 0:
+                            print(f"   ⏭️  Skipped {skipped_count} devices with complete information")
+                    else:
+                        print(f"✨ All {len(discovered)} devices have complete information - skipping deep scan")
+                
+                # Perform enhanced device info gathering for selected devices
+                enhanced_info_map = {}
+                if devices_needing_deep_scan:
                     try:
                         devices_to_scan = [
                             {'ip': d.ip_address, 'mac': d.mac_address}
-                            for d in discovered
+                            for d in devices_needing_deep_scan
                         ]
+                        print(f"📋 Deep scan will check {len(devices_to_scan)} devices: {[d['ip'] for d in devices_to_scan]}")
                         # Run deep scan with a global timeout to avoid blocking the main scan loop
                         enhanced_results = await asyncio.wait_for(
                             self.device_info_scanner.scan_network_enhanced(devices_to_scan),
@@ -186,7 +267,7 @@ class NetworkScanner:
                     except Exception as e:
                         print(f"Enhanced scan error: {e}")
                 
-                # Get all existing devices
+                # Refresh existing_devices in case we need the latest data
                 result = await session.execute(select(Device))
                 existing_devices = {d.mac_address: d for d in result.scalars().all()}
                 

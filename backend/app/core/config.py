@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     OFFLINE_GRACE_SCANS: int = 3  # missed scans before marking device offline
     DEFAULT_SUBNET: Optional[str] = None  # Auto-detect if None
     
+    # Deep Scan Optimization
+    DEEP_SCAN_COMPLETE_INFO_SKIP_HOURS: int = 24  # Skip deep scan if device has complete info and was updated within this many hours
+    DEEP_SCAN_PERIODIC_REFRESH_DAYS: int = 7  # Force deep scan of complete devices after this many days
+    
     # CORS
     CORS_ORIGINS: list[str] = ["*"]
     
