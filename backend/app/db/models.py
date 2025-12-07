@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Float
 from sqlalchemy.orm import relationship
-from datetime import datetime
+from datetime import datetime, timezone
 from .database import Base
 
 
@@ -29,10 +29,10 @@ class Device(Base):
     missed_scans = Column(Integer, default=0)  # Number of consecutive scans where device was not seen
     
     # Timestamps
-    first_seen = Column(DateTime, default=datetime.utcnow)
-    last_seen = Column(DateTime, default=datetime.utcnow)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
     # Network info
     open_ports = Column(Text)  # JSON string of open ports
@@ -55,7 +55,7 @@ class ScanEvent(Base):
     event_type = Column(String(20), nullable=False)  # connected, disconnected, ip_changed
     ip_address = Column(String(45))
     old_ip_address = Column(String(45))  # For IP change events
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     
     # Additional scan data
     response_time = Column(Float)  # in milliseconds
@@ -74,7 +74,7 @@ class ScanSession(Base):
     __tablename__ = "scan_sessions"
     
     id = Column(Integer, primary_key=True, index=True)
-    started_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     completed_at = Column(DateTime)
     status = Column(String(20), default="running")  # running, completed, failed
     devices_found = Column(Integer, default=0)

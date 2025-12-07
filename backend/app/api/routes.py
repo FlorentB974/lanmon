@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import ipaddress
 
 from ..db.database import get_db
@@ -149,36 +149,75 @@ async def update_device(
     db: AsyncSession = Depends(get_db)
 ):
     """Update a device's custom fields."""
-    result = await db.execute(select(Device).where(Device.id == device_id))
-    device = result.scalar_one_or_none()
+    from sqlalchemy.exc import OperationalError
+    import asyncio
     
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-    
-    update_data = device_update.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(device, key, value)
-    
-    device.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(device)
-    
-    return DeviceResponse.model_validate(device)
+    # Retry logic for database locks
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = await db.execute(select(Device).where(Device.id == device_id))
+            device = result.scalar_one_or_none()
+            
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            update_data = device_update.model_dump(exclude_unset=True)
+            for key, value in update_data.items():
+                setattr(device, key, value)
+            
+            device.updated_at = datetime.now(timezone.utc)
+            await db.commit()
+            await db.refresh(device)
+            
+            return DeviceResponse.model_validate(device)
+            
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                await db.rollback()
+                wait_time = 0.5 * (2 ** attempt)  # Exponential backoff
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Database is temporarily busy, please try again"
+                )
 
 
 @router.delete("/devices/{device_id}")
 async def delete_device(device_id: int, db: AsyncSession = Depends(get_db)):
     """Delete a device and its history."""
-    result = await db.execute(select(Device).where(Device.id == device_id))
-    device = result.scalar_one_or_none()
+    from sqlalchemy.exc import OperationalError
+    import asyncio
     
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-    
-    await db.delete(device)
-    await db.commit()
-    
-    return {"message": "Device deleted successfully"}
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = await db.execute(select(Device).where(Device.id == device_id))
+            device = result.scalar_one_or_none()
+            
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            await db.delete(device)
+            await db.commit()
+            
+            return {"message": "Device deleted successfully"}
+            
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                await db.rollback()
+                wait_time = 0.5 * (2 ** attempt)
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Database is temporarily busy, please try again"
+                )
 
 
 @router.get("/devices/{device_id}/events", response_model=list[ScanEventResponse])
@@ -245,41 +284,59 @@ async def trigger_scan(
 async def rescan_device(device_id: int, db: AsyncSession = Depends(get_db)):
     """Rescan a specific device to gather enhanced information."""
     from ..scanner.device_info import DeviceInfoScanner
+    from sqlalchemy.exc import OperationalError
     import json
+    import asyncio
     
-    result = await db.execute(select(Device).where(Device.id == device_id))
-    device = result.scalar_one_or_none()
-    
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-    
-    if not device.ip_address:
-        raise HTTPException(status_code=400, detail="Device has no IP address")
-    
-    # Perform enhanced scan
-    scanner = DeviceInfoScanner(timeout=3.0)
-    enhanced_info = await scanner.get_device_info(device.ip_address, device.mac_address)
-    
-    # Update device with enhanced info
-    if enhanced_info.primary_hostname and (not device.hostname or device.hostname.endswith('.local')):
-        device.hostname = enhanced_info.primary_hostname
-    
-    if enhanced_info.manufacturer and not device.vendor:
-        device.vendor = enhanced_info.manufacturer
-    elif enhanced_info.vendor and not device.vendor:
-        device.vendor = enhanced_info.vendor
-    
-    if enhanced_info.detected_type:
-        device.device_type = enhanced_info.detected_type
-    
-    if enhanced_info.open_ports:
-        device.open_ports = json.dumps(enhanced_info.open_ports)
-    
-    device.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(device)
-    
-    return DeviceResponse.model_validate(device)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = await db.execute(select(Device).where(Device.id == device_id))
+            device = result.scalar_one_or_none()
+            
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            if not device.ip_address:
+                raise HTTPException(status_code=400, detail="Device has no IP address")
+            
+            # Perform enhanced scan
+            scanner = DeviceInfoScanner(timeout=3.0)
+            enhanced_info = await scanner.get_device_info(device.ip_address, device.mac_address)
+            
+            # Update device with enhanced info
+            if enhanced_info.primary_hostname and (not device.hostname or device.hostname.endswith('.local')):
+                device.hostname = enhanced_info.primary_hostname
+            
+            if enhanced_info.manufacturer and not device.vendor:
+                device.vendor = enhanced_info.manufacturer
+            elif enhanced_info.vendor and not device.vendor:
+                device.vendor = enhanced_info.vendor
+            
+            if enhanced_info.detected_type:
+                device.device_type = enhanced_info.detected_type
+            
+            if enhanced_info.open_ports:
+                device.open_ports = json.dumps(enhanced_info.open_ports)
+            
+            device.updated_at = datetime.now(timezone.utc)
+            await db.commit()
+            await db.refresh(device)
+            
+            return DeviceResponse.model_validate(device)
+            
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                await db.rollback()
+                wait_time = 0.5 * (2 ** attempt)
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Database is temporarily busy, please try again"
+                )
 
 
 @router.delete("/devices/cleanup-subnet")
@@ -345,7 +402,7 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     )
     
     # Devices seen in last 24 hours
-    last_24h = datetime.utcnow() - timedelta(hours=24)
+    last_24h = datetime.now(timezone.utc) - timedelta(hours=24)
     active_24h = await db.scalar(
         select(func.count()).select_from(Device).where(Device.last_seen >= last_24h)
     )

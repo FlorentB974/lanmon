@@ -3,7 +3,7 @@ import socket
 import struct
 import fcntl
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     import netifaces
@@ -142,7 +142,7 @@ class NetworkScanner:
             scan_session = ScanSession(
                 subnet=subnet,
                 scan_method="arp+enhanced" if deep_scan else "arp",
-                started_at=datetime.utcnow()
+                started_at=datetime.now(timezone.utc)
             )
             session.add(scan_session)
             await session.flush()
@@ -205,7 +205,7 @@ class NetworkScanner:
                             # Device was online but not found in this scan
                             # Increment missed_scans counter
                             device.missed_scans = (device.missed_scans or 0) + 1
-                            device.updated_at = datetime.utcnow()
+                            device.updated_at = datetime.now(timezone.utc)
                             
                             if device.missed_scans >= self.offline_grace_scans:
                                 # Device has been missing for multiple scans, verify before marking offline
@@ -232,7 +232,7 @@ class NetworkScanner:
                         # Device is truly offline
                         device.is_online = False
                         device.missed_scans = 0
-                        device.updated_at = datetime.utcnow()
+                        device.updated_at = datetime.now(timezone.utc)
                         print(f"  ✗ {device.ip_address}: {device.hostname or device.mac_address} - offline")
                         
                         # Create disconnection event
@@ -314,8 +314,8 @@ class NetworkScanner:
                         device.ip_address = disc_device.ip_address
                         device.is_online = True
                         device.missed_scans = 0  # Reset missed scans counter
-                        device.last_seen = datetime.utcnow()
-                        device.updated_at = datetime.utcnow()
+                        device.last_seen = datetime.now(timezone.utc)
+                        device.updated_at = datetime.now(timezone.utc)
                         
                         # Update hostname if we found a better one
                         if hostname and (not device.hostname or device.hostname.endswith('.local')):
@@ -401,8 +401,8 @@ class NetworkScanner:
                             is_online=True,
                             is_known=False,  # New device starts as unknown
                             missed_scans=0,
-                            first_seen=datetime.utcnow(),
-                            last_seen=datetime.utcnow()
+                            first_seen=datetime.now(timezone.utc),
+                            last_seen=datetime.now(timezone.utc)
                         )
                         session.add(device)
                         await session.flush()
@@ -426,7 +426,7 @@ class NetworkScanner:
                         })
                 
                 # Update scan session
-                scan_session.completed_at = datetime.utcnow()
+                scan_session.completed_at = datetime.now(timezone.utc)
                 scan_session.status = "completed"
                 scan_session.devices_found = devices_found
                 scan_session.devices_online = devices_online
@@ -450,7 +450,7 @@ class NetworkScanner:
             except Exception as e:
                 scan_session.status = "failed"
                 scan_session.error_message = str(e)
-                scan_session.completed_at = datetime.utcnow()
+                scan_session.completed_at = datetime.now(timezone.utc)
                 await session.commit()
                 
                 await self._notify_callbacks("scan_failed", {
