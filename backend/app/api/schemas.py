@@ -6,6 +6,7 @@ from typing import Optional
 class DeviceBase(BaseModel):
     """Base device schema."""
     mac_address: str
+    mac_aliases: Optional[str] = None
     ip_address: Optional[str] = None
     hostname: Optional[str] = None
     vendor: Optional[str] = None

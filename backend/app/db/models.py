@@ -11,6 +11,9 @@ class Device(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     mac_address = Column(String(17), unique=True, index=True, nullable=False)
+    # JSON array of previously observed MAC addresses. Phones and laptops can
+    # rotate their private Wi-Fi address, so MAC alone is not a durable identity.
+    mac_aliases = Column(Text, default="[]")
     ip_address = Column(String(45), index=True)  # IPv6 compatible
     hostname = Column(String(255))
     vendor = Column(String(255))

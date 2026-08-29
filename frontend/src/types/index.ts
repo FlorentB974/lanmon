@@ -1,6 +1,7 @@
 export interface Device {
   id: number;
   mac_address: string;
+  mac_aliases: string | null;
   ip_address: string | null;
   hostname: string | null;
   vendor: string | null;

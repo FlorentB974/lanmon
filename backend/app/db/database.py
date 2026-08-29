@@ -56,6 +56,14 @@ async def init_db():
         # Create tables
         await conn.run_sync(Base.metadata.create_all)
 
+        # create_all() does not alter tables that already exist. Keep the
+        # lightweight SQLite setup self-migrating for installations created
+        # before rotating-MAC support was added.
+        columns = await conn.execute(text("PRAGMA table_info(devices)"))
+        device_columns = {row[1] for row in columns.fetchall()}
+        if "mac_aliases" not in device_columns:
+            await conn.execute(text("ALTER TABLE devices ADD COLUMN mac_aliases TEXT DEFAULT '[]'"))
+
 
 def with_db_retry(max_retries: int = 3, delay: float = 0.5):
     """Decorator to retry database operations on lock errors."""

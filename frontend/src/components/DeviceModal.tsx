@@ -83,6 +83,16 @@ function parseOpenPorts(openPorts: string | null): number[] {
   }
 }
 
+function parseMacAliases(macAliases: string | null): string[] {
+  if (!macAliases) return [];
+  try {
+    const parsed = JSON.parse(macAliases);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function getPortInfo(port: number) {
   return portInfo[port] || { name: port.toString(), description: "Unknown Service", icon: Network };
 }
@@ -115,6 +125,8 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [events, setEvents] = useState<ScanEvent[]>([]);
   const [loading, setLoading] = useState(false);
+  const [actionLoading, setActionLoading] = useState<"favorite" | "known" | null>(null);
+  const [error, setError] = useState<string | null>(null);
   
   const [form, setForm] = useState({
     custom_name: device.custom_name || "",
@@ -126,12 +138,33 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
 
   const iconKey = getDeviceIcon(device);
   const Icon = iconMap[iconKey] || HelpCircle;
+  const macAliases = parseMacAliases(device.mac_aliases);
+
+  useEffect(() => {
+    setForm({
+      custom_name: device.custom_name || "",
+      device_type: device.device_type || "",
+      notes: device.notes || "",
+      is_favorite: device.is_favorite,
+      is_known: device.is_known,
+    });
+    setIsEditing(false);
+    setError(null);
+  }, [device.id]);
 
   useEffect(() => {
     if (showHistory) {
       loadEvents();
     }
   }, [showHistory]);
+
+  useEffect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [onClose]);
 
   const loadEvents = async () => {
     try {
@@ -144,39 +177,54 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
 
   const handleSave = async () => {
     setLoading(true);
+    setError(null);
     try {
       const updated = await api.updateDevice(device.id, form);
       onUpdate(updated);
       setIsEditing(false);
     } catch (error) {
       console.error("Failed to update device:", error);
+      setError("Could not save these changes. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
   const handleToggleFavorite = async () => {
+    setActionLoading("favorite");
+    setError(null);
     try {
       const updated = await api.updateDevice(device.id, {
         is_favorite: !device.is_favorite,
       });
+      setForm((current) => ({ ...current, is_favorite: updated.is_favorite }));
       onUpdate(updated);
     } catch (error) {
       console.error("Failed to toggle favorite:", error);
+      setError("Could not update the star. Please try again.");
+    } finally {
+      setActionLoading(null);
     }
   };
 
   const handleMarkKnown = async () => {
+    setActionLoading("known");
+    setError(null);
     try {
       const updated = await api.updateDevice(device.id, { is_known: true });
+      setForm((current) => ({ ...current, is_known: updated.is_known }));
       onUpdate(updated);
     } catch (error) {
       console.error("Failed to mark as known:", error);
+      setError("Could not mark this device as known. Please try again.");
+    } finally {
+      setActionLoading(null);
     }
   };
 
   const handleDelete = async () => {
     setLoading(true);
+    setError(null);
     try {
       await api.deleteDevice(device.id);
       if (onDelete) {
@@ -185,7 +233,7 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
       onClose();
     } catch (error) {
       console.error("Failed to delete device:", error);
-      alert("Failed to delete device. Please try again.");
+      setError("Could not delete this device. Please try again.");
     } finally {
       setLoading(false);
       setShowDeleteConfirm(false);
@@ -210,18 +258,22 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
+      role="presentation"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm"
       onClick={onClose}
     >
       <motion.div
-        initial={{ scale: 0.95, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        exit={{ scale: 0.95, opacity: 0 }}
+        initial={{ x: "100%" }}
+        animate={{ x: 0 }}
+        exit={{ x: "100%" }}
         onClick={(e) => e.stopPropagation()}
-        className="glass rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-hidden"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Device details"
+        className="glass ml-auto flex h-full w-full max-w-xl flex-col overflow-hidden rounded-l-2xl border-y-0 border-r-0"
       >
         {/* Header */}
-        <div className="relative p-6 border-b border-slate-700/50">
+        <div className="relative shrink-0 border-b border-slate-700/50 p-6">
           <div className={cn(
             "absolute top-0 left-0 right-0 h-1",
             device.is_online ? "bg-gradient-to-r from-emerald-500 to-emerald-400" : "bg-slate-600"
@@ -273,8 +325,10 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
 
             <button
               onClick={handleToggleFavorite}
+              disabled={actionLoading === "favorite"}
+              aria-label={device.is_favorite ? "Remove star" : "Star device"}
               className={cn(
-                "p-2 rounded-lg transition-colors",
+                "rounded-lg p-2 transition-colors disabled:opacity-50",
                 device.is_favorite 
                   ? "text-yellow-400 hover:bg-yellow-400/20" 
                   : "text-slate-500 hover:bg-slate-700/50"
@@ -286,7 +340,14 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
         </div>
 
         {/* Body */}
-        <div className="p-6 overflow-y-auto max-h-[60vh]">
+        <div className="flex-1 overflow-y-auto p-6">
+          {error && (
+            <div className="mb-5 flex items-start gap-2 rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-300">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+
           {/* New device banner */}
           {!device.is_known && (
             <div className="mb-6 p-4 bg-yellow-500/10 border border-yellow-500/30 rounded-lg flex items-center justify-between">
@@ -296,6 +357,7 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
               </div>
               <button
                 onClick={handleMarkKnown}
+                disabled={actionLoading === "known"}
                 className="px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-black font-medium rounded-lg transition-colors"
               >
                 Mark as Known
@@ -309,6 +371,15 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
               <p className="text-xs text-slate-500 uppercase tracking-wider">MAC Address</p>
               <p className="font-mono text-white mt-1">{formatMacAddress(device.mac_address)}</p>
             </div>
+            {macAliases.length > 0 && (
+              <div className="p-3 bg-surface-800/50 rounded-lg">
+                <p className="text-xs text-slate-500 uppercase tracking-wider">Previous MACs</p>
+                <p className="mt-1 font-mono text-xs text-slate-300">
+                  {macAliases.map((mac) => formatMacAddress(mac)).join(", ")}
+                </p>
+                <p className="mt-1 text-[11px] text-slate-500">Private addresses grouped with this device</p>
+              </div>
+            )}
             <div className="p-3 bg-surface-800/50 rounded-lg">
               <p className="text-xs text-slate-500 uppercase tracking-wider">IP Address</p>
               <p className="font-mono text-white mt-1">{device.ip_address || "—"}</p>

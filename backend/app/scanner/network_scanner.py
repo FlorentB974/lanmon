@@ -2,6 +2,7 @@ import asyncio
 import socket
 import struct
 import fcntl
+import json
 from typing import Optional, List
 from datetime import datetime, timezone
 
@@ -21,6 +22,10 @@ from sqlalchemy.orm import selectinload
 from datetime import timedelta
 
 
+class ScanInProgressError(RuntimeError):
+    """Raised when a second scan is requested while one is already running."""
+
+
 class NetworkScanner:
     """Main network scanner orchestrating device discovery and tracking."""
     
@@ -34,11 +39,124 @@ class NetworkScanner:
         self.device_info_scanner = DeviceInfoScanner()
         self._running = False
         self._scan_task: Optional[asyncio.Task] = None
+        self._scan_lock = asyncio.Lock()
         self._websocket_callbacks = []
         
         # Deep scan optimization settings
         self.deep_scan_interval_hours = settings.DEEP_SCAN_PERIODIC_REFRESH_DAYS * 24
         self.recent_update_threshold_hours = settings.DEEP_SCAN_COMPLETE_INFO_SKIP_HOURS
+
+    @property
+    def is_scanning(self) -> bool:
+        """Whether an ARP/deep scan is currently holding the scanner lock."""
+        return self._scan_lock.locked()
+
+    @staticmethod
+    def _normalise_mac(mac: Optional[str]) -> str:
+        return (mac or "").strip().lower().replace("-", ":")
+
+    @classmethod
+    def _is_private_mac(cls, mac: Optional[str]) -> bool:
+        """Return True for locally administered/private Wi-Fi MAC addresses."""
+        try:
+            first_octet = int(cls._normalise_mac(mac).split(":")[0], 16)
+            return bool(first_octet & 0x02)
+        except (ValueError, IndexError):
+            return False
+
+    @staticmethod
+    def _mac_aliases(device: Device) -> list[str]:
+        try:
+            aliases = json.loads(device.mac_aliases or "[]")
+            if isinstance(aliases, list):
+                return [str(alias).lower() for alias in aliases]
+        except (TypeError, ValueError):
+            pass
+        return []
+
+    def _device_lookup(self, devices: list[Device]) -> dict[str, Device]:
+        """Index current and historical MACs to the same logical device."""
+        lookup: dict[str, Device] = {}
+        for device in devices:
+            lookup[self._normalise_mac(device.mac_address)] = device
+            for alias in self._mac_aliases(device):
+                lookup[alias] = device
+        return lookup
+
+    def _find_rotating_mac_match(
+        self,
+        discovered: DiscoveredDevice,
+        enhanced: Optional[EnhancedDeviceInfo],
+        existing_devices: list[Device],
+        used_device_ids: set[int],
+    ) -> Optional[Device]:
+        """Match a private MAC to a previous row using multiple stable signals.
+
+        A locally administered MAC is not enough on its own: the same address
+        can be used by unrelated devices. The IP plus a hostname/model signal,
+        or a recently-seen private MAC on the same IP, gives us a useful and
+        conservative match without merging ordinary DHCP changes.
+        """
+        if not self._is_private_mac(discovered.mac_address):
+            return None
+
+        discovered_hostname = (
+            enhanced.primary_hostname if enhanced and enhanced.primary_hostname else discovered.hostname
+        )
+        discovered_values = {
+            "hostname": discovered_hostname,
+            "friendly_name": enhanced.hostnames[0] if enhanced and enhanced.hostnames else None,
+            "model": enhanced.model if enhanced else None,
+            "manufacturer": enhanced.manufacturer if enhanced else None,
+            "vendor": (enhanced.vendor if enhanced and enhanced.vendor else discovered.vendor),
+            "device_type": enhanced.detected_type if enhanced else None,
+        }
+
+        def clean(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return None
+            value = value.strip().lower()
+            if value.endswith(".local"):
+                return None
+            return value
+
+        candidates: list[tuple[int, Device]] = []
+        for device in existing_devices:
+            if device.id in used_device_ids:
+                continue
+
+            score = 0
+            if device.ip_address and device.ip_address == discovered.ip_address:
+                score += 3
+
+            for field, weight in (("hostname", 5), ("friendly_name", 5), ("model", 3), ("manufacturer", 2), ("vendor", 1), ("device_type", 1)):
+                incoming = clean(discovered_values[field])
+                current = clean(getattr(device, field, None))
+                if incoming and current and incoming == current:
+                    score += weight
+
+            has_private_history = self._is_private_mac(device.mac_address) or any(
+                self._is_private_mac(alias) for alias in self._mac_aliases(device)
+            )
+            same_ip = device.ip_address == discovered.ip_address
+
+            # Same IP + a private historical MAC is the common Apple/Android
+            # rotation case when discovery has no hostname. It is only used
+            # when there is a single best candidate.
+            if same_ip and has_private_history:
+                score += 2
+
+            if score >= 5:
+                candidates.append((score, device))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _best_score, best_device = candidates[0]
+        if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+            return None
+        return best_device
     
     def _should_deep_scan_device(self, device: Device) -> bool:
         """
@@ -185,6 +303,17 @@ class NetworkScanner:
             await asyncio.sleep(self.scan_interval)
     
     async def perform_scan(self, subnet: Optional[str] = None, deep_scan: bool = True) -> dict:
+        """Run one scan without allowing background/manual scans to overlap."""
+        if self._scan_lock.locked():
+            raise ScanInProgressError("A network scan is already in progress")
+
+        await self._scan_lock.acquire()
+        try:
+            return await self._perform_scan(subnet=subnet, deep_scan=deep_scan)
+        finally:
+            self._scan_lock.release()
+
+    async def _perform_scan(self, subnet: Optional[str] = None, deep_scan: bool = True) -> dict:
         """
         Perform a network scan and update the database.
         
@@ -207,6 +336,9 @@ class NetworkScanner:
             )
             session.add(scan_session)
             await session.flush()
+            # Do not keep a write transaction open while ARP/mDNS/HTTP probes
+            # run. That used to make edits from the drawer wait behind a scan.
+            await session.commit()
             
             try:
                 # Notify scan started
@@ -225,13 +357,15 @@ class NetworkScanner:
                 
                 # Get all existing devices to determine which need deep scanning
                 result = await session.execute(select(Device))
-                existing_devices = {d.mac_address: d for d in result.scalars().all()}
+                existing_device_list = result.scalars().all()
+                existing_devices = {self._normalise_mac(d.mac_address): d for d in existing_device_list}
+                device_lookup = self._device_lookup(existing_device_list)
                 
                 # Determine which devices need deep scanning
                 devices_needing_deep_scan = []
                 if deep_scan and discovered:
                     for disc_device in discovered:
-                        existing_device = existing_devices.get(disc_device.mac_address)
+                        existing_device = device_lookup.get(self._normalise_mac(disc_device.mac_address))
                         if existing_device is None or self._should_deep_scan_device(existing_device):
                             devices_needing_deep_scan.append(disc_device)
                     
@@ -242,6 +376,10 @@ class NetworkScanner:
                             print(f"   ⏭️  Skipped {skipped_count} devices with complete information")
                     else:
                         print(f"✨ All {len(discovered)} devices have complete information - skipping deep scan")
+
+                # Release the read transaction while network probes are in
+                # flight. A fresh snapshot is loaded before applying changes.
+                await session.rollback()
                 
                 # Perform enhanced device info gathering for selected devices
                 enhanced_info_map = {}
@@ -269,7 +407,29 @@ class NetworkScanner:
                 
                 # Refresh existing_devices in case we need the latest data
                 result = await session.execute(select(Device))
-                existing_devices = {d.mac_address: d for d in result.scalars().all()}
+                existing_device_list = result.scalars().all()
+                existing_devices = {self._normalise_mac(d.mac_address): d for d in existing_device_list}
+                device_lookup = self._device_lookup(existing_device_list)
+
+                # Resolve all discoveries before marking missing devices
+                # offline. A newly rotated private MAC should count as the
+                # same device for this scan rather than as a disconnect/new
+                # pair.
+                matched_devices: dict[str, Device] = {}
+                matched_device_ids: set[int] = set()
+                for disc_device in discovered:
+                    observed_mac = self._normalise_mac(disc_device.mac_address)
+                    device = device_lookup.get(observed_mac)
+                    if device is None:
+                        device = self._find_rotating_mac_match(
+                            disc_device,
+                            enhanced_info_map.get(disc_device.ip_address),
+                            existing_device_list,
+                            matched_device_ids,
+                        )
+                    if device is not None:
+                        matched_devices[observed_mac] = device
+                        matched_device_ids.add(device.id)
                 
                 # Track statistics
                 devices_found = len(discovered)
@@ -281,6 +441,9 @@ class NetworkScanner:
                 devices_to_verify = []
                 
                 for mac, device in existing_devices.items():
+                    if device.id in matched_device_ids:
+                        device.missed_scans = 0
+                        continue
                     if mac not in current_macs:
                         if device.is_online:
                             # Device was online but not found in this scan
@@ -386,11 +549,23 @@ class NetworkScanner:
                         # Keep only first 10 services to avoid huge strings
                         services_str = json.dumps(enhanced.mdns_services[:10])
                     
-                    if disc_device.mac_address in existing_devices:
+                    observed_mac = self._normalise_mac(disc_device.mac_address)
+                    device = matched_devices.get(observed_mac) or device_lookup.get(observed_mac)
+                    if device is not None:
                         # Update existing device
-                        device = existing_devices[disc_device.mac_address]
                         old_ip = device.ip_address
                         was_online = device.is_online
+
+                        # Preserve the old address as an alias before moving
+                        # the current address to the newly observed private
+                        # MAC. This keeps future scans attached to one row.
+                        old_mac = self._normalise_mac(device.mac_address)
+                        if old_mac != observed_mac:
+                            aliases = self._mac_aliases(device)
+                            if old_mac and old_mac not in aliases:
+                                aliases.append(old_mac)
+                            device.mac_aliases = json.dumps(aliases)
+                            device.mac_address = observed_mac
                         
                         device.ip_address = disc_device.ip_address
                         device.is_online = True
@@ -469,7 +644,8 @@ class NetworkScanner:
                         devices_new += 1
                         
                         device = Device(
-                            mac_address=disc_device.mac_address,
+                            mac_address=observed_mac,
+                            mac_aliases="[]",
                             ip_address=disc_device.ip_address,
                             hostname=hostname,
                             vendor=vendor,

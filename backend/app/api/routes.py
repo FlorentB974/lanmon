@@ -4,6 +4,7 @@ from sqlalchemy import select, func, desc
 from typing import Optional
 from datetime import datetime, timedelta, timezone
 import ipaddress
+import asyncio
 
 from ..db.database import get_db
 from ..db.models import Device, ScanEvent, ScanSession
@@ -262,22 +263,23 @@ async def trigger_scan(
     """Trigger an immediate network scan."""
     from ..main import scanner
     
-    try:
-        result = await scanner.perform_scan(deep_scan=deep_scan)
-        return ScanTriggerResponse(
-            success=True,
-            message="Scan completed successfully",
-            **result
-        )
-    except Exception as e:
-        return ScanTriggerResponse(
-            success=False,
-            message=f"Scan failed: {str(e)}",
-            session_id=0,
-            devices_found=0,
-            devices_online=0,
-            devices_new=0
-        )
+    if scanner.is_scanning:
+        raise HTTPException(status_code=409, detail="A network scan is already in progress")
+
+    async def run_scan() -> None:
+        try:
+            await scanner.perform_scan(deep_scan=deep_scan)
+        except Exception as error:
+            # The scanner broadcasts scan_failed to connected clients. Keep
+            # the background task from producing an unhandled-task warning.
+            print(f"Manual scan failed: {error}")
+
+    # Return immediately so the browser remains interactive while probes run.
+    asyncio.create_task(run_scan())
+    return ScanTriggerResponse(
+        success=True,
+        message="Scan started",
+    )
 
 
 @router.post("/devices/{device_id}/rescan", response_model=DeviceResponse)
@@ -299,10 +301,20 @@ async def rescan_device(device_id: int, db: AsyncSession = Depends(get_db)):
             
             if not device.ip_address:
                 raise HTTPException(status_code=400, detail="Device has no IP address")
+
+            device_ip = device.ip_address
+            device_mac = device.mac_address
+            # Do not hold a database transaction open during network probes.
+            await db.rollback()
             
             # Perform enhanced scan
             scanner = DeviceInfoScanner(timeout=3.0)
-            enhanced_info = await scanner.get_device_info(device.ip_address, device.mac_address)
+            enhanced_info = await scanner.get_device_info(device_ip, device_mac)
+
+            result = await db.execute(select(Device).where(Device.id == device_id))
+            device = result.scalar_one_or_none()
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
             
             # Update device with enhanced info
             if enhanced_info.primary_hostname and (not device.hostname or device.hostname.endswith('.local')):
