@@ -33,6 +33,8 @@ class DeviceResponse(DeviceBase):
     updated_at: datetime
     open_ports: Optional[str] = None
     network_interface: Optional[str] = None
+    is_private_mac: bool = False
+    mac_rotation_detected: bool = False
     manufacturer: Optional[str] = None
     model: Optional[str] = None
     friendly_name: Optional[str] = None

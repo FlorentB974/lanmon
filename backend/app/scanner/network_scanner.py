@@ -53,23 +53,37 @@ class NetworkScanner:
 
     @staticmethod
     def _normalise_mac(mac: Optional[str]) -> str:
-        return (mac or "").strip().lower().replace("-", ":")
+        """Return a stable colon-separated representation of a MAC address."""
+        value = (mac or "").strip().lower().replace("-", ":").replace(".", "")
+        compact = value.replace(":", "")
+        if len(compact) == 12 and all(character in "0123456789abcdef" for character in compact):
+            return ":".join(compact[index:index + 2] for index in range(0, 12, 2))
+        return value
 
     @classmethod
     def _is_private_mac(cls, mac: Optional[str]) -> bool:
         """Return True for locally administered/private Wi-Fi MAC addresses."""
         try:
-            first_octet = int(cls._normalise_mac(mac).split(":")[0], 16)
-            return bool(first_octet & 0x02)
+            parts = cls._normalise_mac(mac).split(":")
+            if len(parts) != 6:
+                return False
+            first_octet = int(parts[0], 16)
+            # Exclude multicast addresses; ARP discoveries should be unicast.
+            return (first_octet & 0x03) == 0x02
         except (ValueError, IndexError):
             return False
 
-    @staticmethod
-    def _mac_aliases(device: Device) -> list[str]:
+    @classmethod
+    def _mac_aliases(cls, device: Device) -> list[str]:
         try:
             aliases = json.loads(device.mac_aliases or "[]")
             if isinstance(aliases, list):
-                return [str(alias).lower() for alias in aliases]
+                normalised = []
+                for alias in aliases:
+                    value = cls._normalise_mac(str(alias))
+                    if value and value not in normalised:
+                        normalised.append(value)
+                return normalised
         except (TypeError, ValueError):
             pass
         return []
@@ -77,10 +91,20 @@ class NetworkScanner:
     def _device_lookup(self, devices: list[Device]) -> dict[str, Device]:
         """Index current and historical MACs to the same logical device."""
         lookup: dict[str, Device] = {}
+        ambiguous: set[str] = set()
         for device in devices:
-            lookup[self._normalise_mac(device.mac_address)] = device
-            for alias in self._mac_aliases(device):
-                lookup[alias] = device
+            addresses = [device.mac_address, *self._mac_aliases(device)]
+            for address in addresses:
+                normalised = self._normalise_mac(address)
+                if not normalised or normalised in ambiguous:
+                    continue
+                previous = lookup.get(normalised)
+                if previous is not None and previous.id != device.id:
+                    # An alias collision is not safe to resolve automatically.
+                    lookup.pop(normalised, None)
+                    ambiguous.add(normalised)
+                    continue
+                lookup[normalised] = device
         return lookup
 
     def _find_rotating_mac_match(
@@ -89,6 +113,7 @@ class NetworkScanner:
         enhanced: Optional[EnhancedDeviceInfo],
         existing_devices: list[Device],
         used_device_ids: set[int],
+        identity_hint: Optional[Device] = None,
     ) -> Optional[Device]:
         """Match a private MAC to a previous row using multiple stable signals.
 
@@ -101,15 +126,33 @@ class NetworkScanner:
             return None
 
         discovered_hostname = (
-            enhanced.primary_hostname if enhanced and enhanced.primary_hostname else discovered.hostname
+            enhanced.primary_hostname if enhanced and enhanced.primary_hostname
+            else discovered.hostname
+            or (identity_hint.hostname if identity_hint else None)
         )
         discovered_values = {
             "hostname": discovered_hostname,
-            "friendly_name": enhanced.hostnames[0] if enhanced and enhanced.hostnames else None,
-            "model": enhanced.model if enhanced else None,
-            "manufacturer": enhanced.manufacturer if enhanced else None,
-            "vendor": (enhanced.vendor if enhanced and enhanced.vendor else discovered.vendor),
-            "device_type": enhanced.detected_type if enhanced else None,
+            "friendly_name": (
+                enhanced.hostnames[0] if enhanced and enhanced.hostnames
+                else (identity_hint.friendly_name if identity_hint else None)
+            ),
+            "model": (
+                enhanced.model if enhanced and enhanced.model
+                else (identity_hint.model if identity_hint else None)
+            ),
+            "manufacturer": (
+                enhanced.manufacturer if enhanced and enhanced.manufacturer
+                else (identity_hint.manufacturer if identity_hint else None)
+            ),
+            "vendor": (
+                enhanced.vendor if enhanced and enhanced.vendor
+                else discovered.vendor
+                or (identity_hint.vendor if identity_hint else None)
+            ),
+            "device_type": (
+                enhanced.detected_type if enhanced and enhanced.detected_type
+                else (identity_hint.device_type if identity_hint else None)
+            ),
         }
 
         def clean(value: Optional[str]) -> Optional[str]:
@@ -120,17 +163,22 @@ class NetworkScanner:
                 return None
             return value
 
+        incoming_values = {
+            field: clean(value) for field, value in discovered_values.items()
+        }
+
         candidates: list[tuple[int, Device]] = []
         for device in existing_devices:
             if device.id in used_device_ids:
                 continue
 
             score = 0
-            if device.ip_address and device.ip_address == discovered.ip_address:
+            same_ip = bool(device.ip_address and device.ip_address == discovered.ip_address)
+            if same_ip:
                 score += 3
 
             for field, weight in (("hostname", 5), ("friendly_name", 5), ("model", 3), ("manufacturer", 2), ("vendor", 1), ("device_type", 1)):
-                incoming = clean(discovered_values[field])
+                incoming = incoming_values[field]
                 current = clean(getattr(device, field, None))
                 if incoming and current and incoming == current:
                     score += weight
@@ -138,11 +186,16 @@ class NetworkScanner:
             has_private_history = self._is_private_mac(device.mac_address) or any(
                 self._is_private_mac(alias) for alias in self._mac_aliases(device)
             )
-            same_ip = device.ip_address == discovered.ip_address
+            # A known device that is still online at the same IP is the
+            # strongest practical signal when the new randomized MAC has no
+            # hostname or vendor. This handles the common first rotation from
+            # a factory MAC, before any alias history exists.
+            if same_ip and device.is_known and device.is_online:
+                score += 4
 
-            # Same IP + a private historical MAC is the common Apple/Android
-            # rotation case when discovery has no hostname. It is only used
-            # when there is a single best candidate.
+            # Same IP + a private historical MAC is also useful when the
+            # device has already rotated once. It is only used when there is
+            # a single sufficiently strong candidate.
             if same_ip and has_private_history:
                 score += 2
 
@@ -153,10 +206,51 @@ class NetworkScanner:
             return None
 
         candidates.sort(key=lambda item: item[0], reverse=True)
-        _best_score, best_device = candidates[0]
-        if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        best_score, best_device = candidates[0]
+        if len(candidates) > 1 and best_score - candidates[1][0] < 2:
             return None
         return best_device
+
+    async def _merge_device_records(
+        self,
+        source: Device,
+        target: Device,
+        session,
+    ) -> None:
+        """Fold an older unknown private-MAC row into a known device row."""
+        # Keep user annotations and any discovery data that the known row is
+        # missing. The known row remains authoritative for conflicting values.
+        for field in (
+            "hostname", "vendor", "manufacturer", "device_type", "model",
+            "friendly_name", "custom_name", "notes", "services", "open_ports",
+            "network_interface",
+        ):
+            if not getattr(target, field, None) and getattr(source, field, None):
+                setattr(target, field, getattr(source, field))
+
+        target.is_favorite = bool(target.is_favorite or source.is_favorite)
+        first_seen_values = [
+            value for value in (target.first_seen, source.first_seen) if value is not None
+        ]
+        if first_seen_values:
+            target.first_seen = min(first_seen_values)
+
+        aliases = self._mac_aliases(target)
+        target_mac = self._normalise_mac(target.mac_address)
+        source_mac = self._normalise_mac(source.mac_address)
+        for address in [target_mac, source_mac, *self._mac_aliases(source)]:
+            if address and address not in aliases:
+                aliases.append(address)
+        target.mac_aliases = json.dumps(aliases)
+
+        # Preserve the source row's event history under the durable device ID
+        # before deleting the duplicate row.
+        await session.execute(
+            update(ScanEvent)
+            .where(ScanEvent.device_id == source.id)
+            .values(device_id=target.id)
+        )
+        await session.delete(source)
     
     def _should_deep_scan_device(self, device: Device) -> bool:
         """
@@ -417,9 +511,27 @@ class NetworkScanner:
                 # pair.
                 matched_devices: dict[str, Device] = {}
                 matched_device_ids: set[int] = set()
+                devices_to_merge: list[tuple[Device, Device]] = []
                 for disc_device in discovered:
                     observed_mac = self._normalise_mac(disc_device.mac_address)
                     device = device_lookup.get(observed_mac)
+                    if device is not None and self._is_private_mac(observed_mac) and not device.is_known:
+                        # A previous scan may already have created this
+                        # randomized address as an unknown row. Try to attach
+                        # it to a known record before treating the exact MAC
+                        # match as authoritative.
+                        known_match = self._find_rotating_mac_match(
+                            disc_device,
+                            enhanced_info_map.get(disc_device.ip_address),
+                            existing_device_list,
+                            matched_device_ids | {device.id},
+                            identity_hint=device,
+                        )
+                        if known_match is not None and known_match.is_known:
+                            devices_to_merge.append((device, known_match))
+                            matched_devices[observed_mac] = known_match
+                            matched_device_ids.update({device.id, known_match.id})
+                            continue
                     if device is None:
                         device = self._find_rotating_mac_match(
                             disc_device,
@@ -430,6 +542,9 @@ class NetworkScanner:
                     if device is not None:
                         matched_devices[observed_mac] = device
                         matched_device_ids.add(device.id)
+
+                for source, target in devices_to_merge:
+                    await self._merge_device_records(source, target, session)
                 
                 # Track statistics
                 devices_found = len(discovered)
@@ -437,7 +552,7 @@ class NetworkScanner:
                 devices_new = 0
                 
                 # Handle devices not found in this scan - use grace period
-                current_macs = {d.mac_address for d in discovered}
+                current_macs = {self._normalise_mac(d.mac_address) for d in discovered}
                 devices_to_verify = []
                 
                 for mac, device in existing_devices.items():
@@ -561,7 +676,7 @@ class NetworkScanner:
                         # MAC. This keeps future scans attached to one row.
                         old_mac = self._normalise_mac(device.mac_address)
                         if old_mac != observed_mac:
-                            aliases = self._mac_aliases(device)
+                            aliases = [alias for alias in self._mac_aliases(device) if alias != observed_mac]
                             if old_mac and old_mac not in aliases:
                                 aliases.append(old_mac)
                             device.mac_aliases = json.dumps(aliases)

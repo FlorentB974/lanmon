@@ -1,3 +1,5 @@
+import json
+
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Float
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -40,6 +42,34 @@ class Device(Base):
     # Network info
     open_ports = Column(Text)  # JSON string of open ports
     network_interface = Column(String(50))
+
+    @property
+    def is_private_mac(self) -> bool:
+        """Whether the active MAC is a locally administered unicast address.
+
+        Modern phones and laptops commonly use this bit for their private
+        Wi-Fi address. It is only a hint by itself; ``mac_rotation_detected``
+        requires that we have also observed a different address for the same
+        logical device.
+        """
+        try:
+            mac = (self.mac_address or "").strip().lower().replace("-", ":").replace(".", "")
+            compact = mac.replace(":", "")
+            first_octet = int(compact[:2], 16)
+            if len(compact) != 12:
+                return False
+            return (first_octet & 0x03) == 0x02
+        except (ValueError, IndexError):
+            return False
+
+    @property
+    def mac_rotation_detected(self) -> bool:
+        """Whether this device has been grouped across multiple MACs."""
+        try:
+            aliases = json.loads(self.mac_aliases or "[]")
+            return isinstance(aliases, list) and any(aliases)
+        except (TypeError, ValueError):
+            return False
     
     # Relationships
     scan_events = relationship("ScanEvent", back_populates="device", cascade="all, delete-orphan")

@@ -17,6 +17,8 @@ export interface Device {
   updated_at: string;
   open_ports: string | null;
   network_interface: string | null;
+  is_private_mac: boolean;
+  mac_rotation_detected: boolean;
   model: string | null;
   manufacturer: string | null;
   friendly_name: string | null;

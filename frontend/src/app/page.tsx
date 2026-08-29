@@ -643,6 +643,7 @@ export default function Home() {
                     const isSelected = selectedDevice?.id === device.id;
                     const isBulkSelected = selectedDeviceIds.has(device.id);
                     const aliases = parseMacAliases(device);
+                    const macRotationDetected = device.mac_rotation_detected ?? aliases.length > 0;
                     return (
                       <tr
                         key={device.id}
@@ -677,8 +678,10 @@ export default function Home() {
                                 <p className="truncate text-sm font-medium text-white">{deviceName(device)}</p>
                                 {device.is_favorite && <Star className="h-3.5 w-3.5 shrink-0 fill-amber-400 text-amber-400" />}
                                 {!device.is_known && <span className="rounded-full bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">New</span>}
+                                {macRotationDetected && <span className="rounded-full bg-sky-400/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">Rotating MAC</span>}
+                                {!macRotationDetected && device.is_private_mac && <span className="rounded-full bg-violet-400/10 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">Private MAC</span>}
                               </div>
-                              <p className="mt-0.5 truncate font-mono text-[11px] text-slate-600">{formatMacAddress(device.mac_address)}{aliases.length > 0 && " · MAC history grouped"}</p>
+                              <p className="mt-0.5 truncate font-mono text-[11px] text-slate-600">{formatMacAddress(device.mac_address)}{macRotationDetected && ` · ${aliases.length} previous MAC${aliases.length === 1 ? "" : "s"}`}</p>
                             </div>
                           </div>
                         </td>

@@ -2,8 +2,6 @@
 
 A modern, real-time network device monitoring application inspired by [NetAlertX](https://github.com/jokob-sk/NetAlertX).
 
-![LAN Monitor](https://via.placeholder.com/800x400?text=LAN+Monitor+Dashboard)
-
 ## Features
 
 - 🔍 **Device Discovery**: Automatic detection of devices on your local network using ARP scanning
@@ -19,7 +17,7 @@ A modern, real-time network device monitoring application inspired by [NetAlertX
 ### Backend
 - **Framework**: FastAPI (Python 3.11+)
 - **Database**: SQLite with SQLAlchemy ORM
-- **Network Scanning**: Scapy, python-nmap
+- **Network Scanning**: Scapy, arp-scan, and the system ARP table
 - **Real-time**: WebSocket support
 
 ### Frontend
@@ -108,14 +106,6 @@ The application uses multiple methods to discover devices:
 3. **System ARP Table**: Last resort using cached ARP entries
 
 > **Note**: Network scanning typically requires elevated privileges (sudo/admin).
-
-## Screenshots
-
-### Dashboard
-![Dashboard](https://via.placeholder.com/800x400?text=Dashboard+View)
-
-### Device Details
-![Device Details](https://via.placeholder.com/800x400?text=Device+Details+Modal)
 
 ## Development
 

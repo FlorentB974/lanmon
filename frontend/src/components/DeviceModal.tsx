@@ -348,6 +348,24 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
             </div>
           )}
 
+          {(device.mac_rotation_detected || device.is_private_mac) && (
+            <div className={cn(
+              "mb-5 rounded-lg border p-3 text-sm",
+              device.mac_rotation_detected
+                ? "border-sky-500/30 bg-sky-500/10 text-sky-200"
+                : "border-violet-500/30 bg-violet-500/10 text-violet-200",
+            )}>
+              <p className="font-medium">
+                {device.mac_rotation_detected ? "MAC rotation detected" : "Private MAC address"}
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                {device.mac_rotation_detected
+                  ? "This device has been kept together across more than one Wi-Fi MAC address."
+                  : "This address is locally administered; it may be a device privacy address."}
+              </p>
+            </div>
+          )}
+
           {/* New device banner */}
           {!device.is_known && (
             <div className="mb-6 p-4 bg-yellow-500/10 border border-yellow-500/30 rounded-lg flex items-center justify-between">

@@ -9,7 +9,7 @@ from datetime import datetime
 try:
     from scapy.all import ARP, Ether, srp, conf
     SCAPY_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     SCAPY_AVAILABLE = False
 
 # Import our local OUI database lookup

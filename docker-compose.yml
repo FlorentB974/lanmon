@@ -6,7 +6,7 @@ services:
     container_name: lanmon-backend
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/lanmon.db
-      - SCAN_INTERVAL=60
+      - SCAN_INTERVAL=300
     volumes:
       - ./data:/app/data
     # Network scanning requires special privileges
