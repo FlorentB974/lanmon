@@ -65,7 +65,8 @@ async def get_devices(
                        (d.custom_name and search_term in d.custom_name.lower()) or
                        (d.ip_address and search_term in d.ip_address.lower()) or
                        (d.mac_address and search_term in d.mac_address.lower()) or
-                       (d.vendor and search_term in d.vendor.lower())
+                       (d.vendor and search_term in d.vendor.lower()) or
+                       (d.identification_data and search_term in d.identification_data.lower())
                 ]
             
             # Sort
@@ -95,7 +96,8 @@ async def get_devices(
             (Device.custom_name.ilike(search_term)) |
             (Device.ip_address.ilike(search_term)) |
             (Device.mac_address.ilike(search_term)) |
-            (Device.vendor.ilike(search_term))
+            (Device.vendor.ilike(search_term)) |
+            (Device.identification_data.ilike(search_term))
         )
     
     # Get total count
@@ -165,6 +167,8 @@ async def update_device(
             
             update_data = device_update.model_dump(exclude_unset=True)
             for key, value in update_data.items():
+                if key == "device_type" and value == "":
+                    value = None
                 setattr(device, key, value)
             
             device.updated_at = datetime.now(timezone.utc)
@@ -282,73 +286,37 @@ async def trigger_scan(
     )
 
 
-@router.post("/devices/{device_id}/rescan", response_model=DeviceResponse)
-async def rescan_device(device_id: int, db: AsyncSession = Depends(get_db)):
-    """Rescan a specific device to gather enhanced information."""
-    from ..scanner.device_info import DeviceInfoScanner
-    from sqlalchemy.exc import OperationalError
-    import json
-    import asyncio
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            result = await db.execute(select(Device).where(Device.id == device_id))
-            device = result.scalar_one_or_none()
-            
-            if not device:
-                raise HTTPException(status_code=404, detail="Device not found")
-            
-            if not device.ip_address:
-                raise HTTPException(status_code=400, detail="Device has no IP address")
+@router.post("/devices/{device_id}/identify", response_model=DeviceResponse)
+async def identify_device(device_id: int):
+    """Run the rate-limited, evidence-producing identification profile."""
+    from ..main import scanner
+    from ..scanner.network_scanner import (
+        DeviceIdentityMismatchError,
+        DeviceOfflineError,
+        IdentificationCooldownError,
+        ScanInProgressError,
+    )
 
-            device_ip = device.ip_address
-            device_mac = device.mac_address
-            # Do not hold a database transaction open during network probes.
-            await db.rollback()
-            
-            # Perform enhanced scan
-            scanner = DeviceInfoScanner(timeout=3.0)
-            enhanced_info = await scanner.get_device_info(device_ip, device_mac)
+    try:
+        return await scanner.identify_device(device_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+    except IdentificationCooldownError as error:
+        raise HTTPException(
+            status_code=429,
+            detail=str(error),
+            headers={"Retry-After": str(settings.IDENTIFY_COOLDOWN_SECONDS)},
+        )
+    except (DeviceOfflineError, DeviceIdentityMismatchError, ScanInProgressError) as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error))
 
-            result = await db.execute(select(Device).where(Device.id == device_id))
-            device = result.scalar_one_or_none()
-            if not device:
-                raise HTTPException(status_code=404, detail="Device not found")
-            
-            # Update device with enhanced info
-            if enhanced_info.primary_hostname and (not device.hostname or device.hostname.endswith('.local')):
-                device.hostname = enhanced_info.primary_hostname
-            
-            if enhanced_info.manufacturer and not device.vendor:
-                device.vendor = enhanced_info.manufacturer
-            elif enhanced_info.vendor and not device.vendor:
-                device.vendor = enhanced_info.vendor
-            
-            if enhanced_info.detected_type:
-                device.device_type = enhanced_info.detected_type
-            
-            if enhanced_info.open_ports:
-                device.open_ports = json.dumps(enhanced_info.open_ports)
-            
-            device.updated_at = datetime.now(timezone.utc)
-            await db.commit()
-            await db.refresh(device)
-            
-            return DeviceResponse.model_validate(device)
-            
-        except OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                await db.rollback()
-                wait_time = 0.5 * (2 ** attempt)
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                await db.rollback()
-                raise HTTPException(
-                    status_code=503,
-                    detail="Database is temporarily busy, please try again"
-                )
+
+@router.post("/devices/{device_id}/rescan", response_model=DeviceResponse, deprecated=True)
+async def rescan_device(device_id: int):
+    """Compatibility alias for the evidence-based Identify action."""
+    return await identify_device(device_id)
 
 
 @router.delete("/devices/cleanup-subnet")

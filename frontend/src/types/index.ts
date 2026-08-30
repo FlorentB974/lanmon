@@ -1,3 +1,22 @@
+export interface IdentificationEvidence {
+  source: string;
+  summary: string;
+  value: string;
+  strength: "weak" | "medium" | "strong";
+}
+
+export interface IdentificationResult {
+  version: number;
+  label: string | null;
+  category: string | null;
+  confidence: "low" | "medium" | "high" | null;
+  score: number;
+  ambiguous: boolean;
+  evidence: IdentificationEvidence[];
+  probes: Record<string, string>;
+  identified_at: string;
+}
+
 export interface Device {
   id: number;
   mac_address: string;
@@ -23,6 +42,10 @@ export interface Device {
   manufacturer: string | null;
   friendly_name: string | null;
   services: string | null;
+  discovery_info: string | null;
+  identification: IdentificationResult | null;
+  effective_device_type: string | null;
+  last_deep_scan_at: string | null;
 }
 
 export interface DeviceListResponse {

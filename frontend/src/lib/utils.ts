@@ -11,10 +11,11 @@ export function formatMacAddress(mac: string): string {
 
 export function getDeviceIcon(device: {
   device_type?: string | null;
+  effective_device_type?: string | null;
   vendor?: string | null;
   hostname?: string | null;
 }): string {
-  const type = device.device_type?.toLowerCase() || "";
+  const type = (device.effective_device_type || device.device_type)?.toLowerCase() || "";
   const vendor = device.vendor?.toLowerCase() || "";
   const hostname = device.hostname?.toLowerCase() || "";
 

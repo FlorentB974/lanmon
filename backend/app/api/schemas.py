@@ -1,6 +1,25 @@
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
+
+
+class IdentificationEvidence(BaseModel):
+    source: str
+    summary: str
+    value: str
+    strength: Literal["weak", "medium", "strong"]
+
+
+class IdentificationResult(BaseModel):
+    version: int = 1
+    label: Optional[str] = None
+    category: Optional[str] = None
+    confidence: Optional[Literal["low", "medium", "high"]] = None
+    score: int = 0
+    ambiguous: bool = False
+    evidence: list[IdentificationEvidence] = Field(default_factory=list)
+    probes: dict[str, str] = Field(default_factory=dict)
+    identified_at: datetime
 
 
 class DeviceBase(BaseModel):
@@ -17,6 +36,7 @@ class DeviceBase(BaseModel):
     custom_name: Optional[str] = None
     notes: Optional[str] = None
     services: Optional[str] = None
+    discovery_info: Optional[str] = None
 
 
 class DeviceResponse(DeviceBase):
@@ -39,9 +59,13 @@ class DeviceResponse(DeviceBase):
     model: Optional[str] = None
     friendly_name: Optional[str] = None
     services: Optional[str] = None
+    discovery_info: Optional[str] = None
+    identification: Optional[IdentificationResult] = None
+    effective_device_type: Optional[str] = None
+    last_deep_scan_at: Optional[datetime] = None
 
-    @field_serializer('first_seen', 'last_seen', 'created_at', 'updated_at')
-    def serialize_datetime(self, dt: datetime, _info) -> str:
+    @field_serializer('first_seen', 'last_seen', 'created_at', 'updated_at', 'last_deep_scan_at')
+    def serialize_datetime(self, dt: Optional[datetime], _info) -> Optional[str]:
         """Serialize datetime to ISO 8601 format with timezone."""
         if dt:
             # Ensure timezone-aware, add Z suffix for UTC

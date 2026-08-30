@@ -14,6 +14,8 @@ except ImportError:
 
 from .arp_scanner import ARPScanner, DiscoveredDevice
 from .device_info import DeviceInfoScanner, EnhancedDeviceInfo
+from .dhcp_leases import load_dhcp_leases
+from .fingerprint import FingerprintInput, fingerprint_classifier
 from ..db.models import Device, ScanEvent, ScanSession
 from ..db.database import AsyncSessionLocal
 from ..core.config import settings
@@ -24,6 +26,18 @@ from datetime import timedelta
 
 class ScanInProgressError(RuntimeError):
     """Raised when a second scan is requested while one is already running."""
+
+
+class DeviceOfflineError(RuntimeError):
+    """Raised when a targeted identification cannot safely reach its device."""
+
+
+class DeviceIdentityMismatchError(RuntimeError):
+    """Raised when DHCP reuse has moved a different MAC onto the stored IP."""
+
+
+class IdentificationCooldownError(RuntimeError):
+    """Raised when the same device is identified again too quickly."""
 
 
 class NetworkScanner:
@@ -44,7 +58,8 @@ class NetworkScanner:
         
         # Deep scan optimization settings
         self.deep_scan_interval_hours = settings.DEEP_SCAN_PERIODIC_REFRESH_DAYS * 24
-        self.recent_update_threshold_hours = settings.DEEP_SCAN_COMPLETE_INFO_SKIP_HOURS
+        self.incomplete_scan_interval_hours = settings.DEEP_SCAN_INCOMPLETE_REFRESH_HOURS
+        self.identify_cooldown_seconds = settings.IDENTIFY_COOLDOWN_SECONDS
 
     @property
     def is_scanning(self) -> bool:
@@ -222,8 +237,8 @@ class NetworkScanner:
         # missing. The known row remains authoritative for conflicting values.
         for field in (
             "hostname", "vendor", "manufacturer", "device_type", "model",
-            "friendly_name", "custom_name", "notes", "services", "open_ports",
-            "network_interface",
+            "friendly_name", "custom_name", "notes", "services", "discovery_info", "open_ports",
+            "network_interface", "identification_data", "last_deep_scan_at",
         ):
             if not getattr(target, field, None) and getattr(source, field, None):
                 setattr(target, field, getattr(source, field))
@@ -251,62 +266,108 @@ class NetworkScanner:
             .values(device_id=target.id)
         )
         await session.delete(source)
+
+    @staticmethod
+    def _serialise_discovery_info(enhanced: Optional[EnhancedDeviceInfo]) -> Optional[str]:
+        """Keep the raw protocol results that do not fit legacy columns."""
+        if enhanced is None:
+            return None
+
+        details = {
+            "hostnames": enhanced.hostnames,
+            "friendly_name": enhanced.friendly_name,
+            "mdns_services": enhanced.mdns_services,
+            "network_services": enhanced.services,
+            "netbios_name": enhanced.netbios_name,
+            "ssdp": enhanced.ssdp_info,
+            "upnp": enhanced.upnp_info,
+            "http": enhanced.http_info,
+            "banners": enhanced.banners,
+            "tls": enhanced.tls_info,
+            "dhcp": enhanced.dhcp_info,
+            "probes": enhanced.probe_status,
+            "scan_profile": enhanced.scan_profile,
+        }
+        # Avoid storing an empty blob for hosts that answered no metadata
+        # probes. This also preserves older, richer results on a transient
+        # network failure.
+        if not any(value for value in details.values()):
+            return None
+        return json.dumps(details, sort_keys=True)
     
     def _should_deep_scan_device(self, device: Device) -> bool:
-        """
-        Determine if a device needs a deep scan based on information completeness.
-        
-        Criteria for skipping deep scan:
-        - Device is marked as known (is_known=True) - user has acknowledged it
-        - Device has complete information (hostname, vendor/manufacturer, device_type, model, services, open_ports)
-        - Device was updated recently (within last 24 hours)
-        
-        Always deep scan:
-        - New/unknown devices (is_known=False)
-        - Devices with incomplete information
-        - Devices not scanned in the last 7 days (periodic refresh)
-        """
-        # Always scan new/unknown devices
-        if not device.is_known:
+        """Refresh incomplete profiles daily and useful profiles weekly."""
+        if not device.last_deep_scan_at:
             return True
-        
-        # If device is known (marked by user), treat it as complete and check timing
-        # This allows users to skip deep scans on devices they've acknowledged
-        if device.updated_at:
-            now = datetime.now(timezone.utc)
-            
-            # Ensure device.updated_at is timezone-aware for comparison
-            updated_at = device.updated_at
-            if updated_at.tzinfo is None:
-                # If naive datetime, assume it's UTC
-                updated_at = updated_at.replace(tzinfo=timezone.utc)
-            
-            time_since_update = now - updated_at
-            
-            # Skip scan if updated recently (within threshold)
-            if time_since_update < timedelta(hours=self.recent_update_threshold_hours):
-                return False
-            
-            # Force deep scan if not scanned in a long time (periodic refresh)
-            if time_since_update > timedelta(hours=self.deep_scan_interval_hours):
-                return True
-        
-        # For known devices without recent updates, still check if info is complete
-        has_name = bool(device.hostname or device.friendly_name)
-        has_vendor = bool(device.vendor or device.manufacturer)
-        has_type = bool(device.device_type)
-        has_model = bool(device.model)
-        has_services = bool(device.services)
-        has_ports = bool(device.open_ports)
-        
-        is_complete = has_name and has_vendor and has_type and has_model and has_services and has_ports
-        
-        # If device is incomplete, scan it
-        if not is_complete:
+
+        scanned_at = device.last_deep_scan_at
+        if scanned_at.tzinfo is None:
+            scanned_at = scanned_at.replace(tzinfo=timezone.utc)
+        profile = device.identification or {}
+        is_complete = bool(
+            profile.get("label") and profile.get("confidence") in {"medium", "high"}
+        )
+        refresh_hours = self.deep_scan_interval_hours if is_complete else self.incomplete_scan_interval_hours
+        return datetime.now(timezone.utc) - scanned_at >= timedelta(hours=refresh_hours)
+
+    @staticmethod
+    def _parse_json_list(value: Optional[str]) -> list:
+        try:
+            parsed = json.loads(value or "[]")
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError):
+            return []
+
+    def _classify_device(
+        self,
+        enhanced: EnhancedDeviceInfo,
+        *,
+        vendor: Optional[str],
+        existing: Optional[Device] = None,
+    ) -> dict:
+        """Build a typed, explainable identity from current and stored clues."""
+        stored_services = self._parse_json_list(existing.services) if existing else []
+        stored_ports = self._parse_json_list(existing.open_ports) if existing else []
+        return fingerprint_classifier.classify(FingerprintInput(
+            vendor=vendor or (existing.vendor if existing else None),
+            manufacturer=enhanced.manufacturer or (existing.manufacturer if existing else None),
+            model=enhanced.model or (existing.model if existing else None),
+            friendly_name=enhanced.friendly_name or (existing.friendly_name if existing else None),
+            hostnames=list(dict.fromkeys([
+                *enhanced.hostnames,
+                *([existing.hostname] if existing and existing.hostname else []),
+            ])),
+            services=list(dict.fromkeys([*enhanced.mdns_services, *enhanced.services, *stored_services])),
+            open_ports=list(dict.fromkeys([*enhanced.open_ports, *stored_ports])),
+            http_info=enhanced.http_info,
+            upnp_info=enhanced.upnp_info,
+            banners=enhanced.banners,
+            dhcp_info=enhanced.dhcp_info,
+            probes=enhanced.probe_status,
+        ))
+
+    @staticmethod
+    def _should_store_identification(current: Optional[dict], candidate: dict, profile: str) -> bool:
+        if profile != "light" or not current:
             return True
-        
-        # Default: skip deep scan for known devices with complete info
-        return False
+        return int(candidate.get("score") or 0) > int(current.get("score") or 0)
+
+    @staticmethod
+    def _merge_discovery_info(current: Optional[str], incoming: Optional[str]) -> Optional[str]:
+        if not incoming:
+            return current
+        try:
+            current_value = json.loads(current or "{}")
+            incoming_value = json.loads(incoming)
+            if not isinstance(current_value, dict) or not isinstance(incoming_value, dict):
+                return incoming
+            merged = dict(current_value)
+            for key, value in incoming_value.items():
+                if value not in (None, "", [], {}):
+                    merged[key] = value
+            return json.dumps(merged, sort_keys=True)
+        except (TypeError, ValueError):
+            return incoming
     
     def register_callback(self, callback):
         """Register a callback for scan updates."""
@@ -407,6 +468,105 @@ class NetworkScanner:
         finally:
             self._scan_lock.release()
 
+    async def identify_device(self, device_id: int) -> Device:
+        """Run the bounded manual fingerprint profile for one verified host."""
+        if self._scan_lock.locked():
+            raise ScanInProgressError("A network scan or identification is already in progress")
+
+        await self._scan_lock.acquire()
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(Device).where(Device.id == device_id))
+                device = result.scalar_one_or_none()
+                if device is None:
+                    raise LookupError("Device not found")
+                if not device.is_online or not device.ip_address:
+                    raise DeviceOfflineError("Only online devices can be identified")
+
+                if device.last_deep_scan_at:
+                    scanned_at = device.last_deep_scan_at
+                    if scanned_at.tzinfo is None:
+                        scanned_at = scanned_at.replace(tzinfo=timezone.utc)
+                    elapsed = datetime.now(timezone.utc) - scanned_at
+                    if elapsed < timedelta(seconds=self.identify_cooldown_seconds):
+                        remaining = self.identify_cooldown_seconds - int(elapsed.total_seconds())
+                        raise IdentificationCooldownError(
+                            f"Please wait {max(1, remaining)} seconds before identifying this device again"
+                        )
+
+                device_ip = device.ip_address
+                expected_macs = {
+                    self._normalise_mac(device.mac_address),
+                    *self._mac_aliases(device),
+                }
+                await session.rollback()
+
+                observed_mac = await self.arp_scanner.resolve_mac(device_ip)
+                if not observed_mac:
+                    raise DeviceOfflineError("The device did not answer the ARP identity check")
+                observed_mac = self._normalise_mac(observed_mac)
+                if observed_mac not in expected_macs:
+                    raise DeviceIdentityMismatchError(
+                        "The stored IP now belongs to a different MAC address; run a network scan first"
+                    )
+
+                lease_result = load_dhcp_leases(settings.DHCP_LEASE_FILE, settings.DHCP_LEASE_FORMAT)
+                lease = lease_result.by_mac().get(observed_mac)
+                results = await self.device_info_scanner.scan_network_enhanced([{
+                    "ip": device_ip,
+                    "mac": observed_mac,
+                    "profile": "identify",
+                    "dhcp_info": lease.to_discovery_dict() if lease else None,
+                    "dhcp_status": "no_match" if settings.DHCP_LEASE_FILE else "not_configured",
+                }])
+                if not results:
+                    raise RuntimeError("No identification result was collected")
+                enhanced = results[0]
+
+                result = await session.execute(select(Device).where(Device.id == device_id))
+                device = result.scalar_one_or_none()
+                if device is None:
+                    raise LookupError("Device not found")
+                if device.ip_address != device_ip:
+                    raise DeviceIdentityMismatchError("The device IP changed during identification")
+
+                if enhanced.primary_hostname and (not device.hostname or device.hostname.endswith(".local")):
+                    device.hostname = enhanced.primary_hostname
+                if enhanced.friendly_name:
+                    device.friendly_name = enhanced.friendly_name
+                if enhanced.manufacturer:
+                    device.manufacturer = enhanced.manufacturer
+                    if not device.vendor:
+                        device.vendor = enhanced.manufacturer
+                if self.device_info_scanner._valid_model(enhanced.model):
+                    device.model = enhanced.model
+                if enhanced.open_ports:
+                    device.open_ports = json.dumps(sorted(set(enhanced.open_ports)))
+                services = list(dict.fromkeys([*enhanced.mdns_services, *enhanced.services]))
+                if services:
+                    device.services = json.dumps(list(dict.fromkeys([
+                        *self._parse_json_list(device.services),
+                        *services,
+                    ])))
+                device.discovery_info = self._merge_discovery_info(
+                    device.discovery_info,
+                    self._serialise_discovery_info(enhanced),
+                )
+                device.set_identification(self._classify_device(
+                    enhanced,
+                    vendor=device.vendor,
+                    existing=device,
+                ))
+                device.last_deep_scan_at = datetime.now(timezone.utc)
+                device.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+                await session.refresh(device)
+
+                await self._notify_callbacks("device_identified", {"device_id": device.id})
+                return device
+        finally:
+            self._scan_lock.release()
+
     async def _perform_scan(self, subnet: Optional[str] = None, deep_scan: bool = True) -> dict:
         """
         Perform a network scan and update the database.
@@ -454,8 +614,19 @@ class NetworkScanner:
                 existing_device_list = result.scalars().all()
                 existing_devices = {self._normalise_mac(d.mac_address): d for d in existing_device_list}
                 device_lookup = self._device_lookup(existing_device_list)
+
+                lease_result = load_dhcp_leases(
+                    settings.DHCP_LEASE_FILE,
+                    settings.DHCP_LEASE_FORMAT,
+                )
+                lease_by_mac = lease_result.by_mac()
+                for diagnostic in lease_result.diagnostics:
+                    print(f"⚠️ DHCP lease input: {diagnostic}")
                 
-                # Determine which devices need deep scanning
+                # Determine which devices need the more intrusive probes.
+                # mDNS/DNS metadata is still refreshed for every discovered
+                # host below, otherwise known devices stop receiving new
+                # hostnames and service announcements.
                 devices_needing_deep_scan = []
                 if deep_scan and discovered:
                     for disc_device in discovered:
@@ -464,12 +635,12 @@ class NetworkScanner:
                             devices_needing_deep_scan.append(disc_device)
                     
                     if devices_needing_deep_scan:
-                        print(f"🔍 Performing deep scan on {len(devices_needing_deep_scan)}/{len(discovered)} devices...")
+                        print(f"🔍 Performing scheduled deep probes on {len(devices_needing_deep_scan)}/{len(discovered)} devices; refreshing multicast/DNS for all...")
                         skipped_count = len(discovered) - len(devices_needing_deep_scan)
                         if skipped_count > 0:
                             print(f"   ⏭️  Skipped {skipped_count} devices with complete information")
                     else:
-                        print(f"✨ All {len(discovered)} devices have complete information - skipping deep scan")
+                        print(f"✨ All {len(discovered)} devices have complete information - refreshing mDNS/DNS only")
 
                 # Release the read transaction while network probes are in
                 # flight. A fresh snapshot is loaded before applying changes.
@@ -477,13 +648,26 @@ class NetworkScanner:
                 
                 # Perform enhanced device info gathering for selected devices
                 enhanced_info_map = {}
-                if devices_needing_deep_scan:
+                if deep_scan and discovered:
                     try:
+                        deep_macs = {
+                            self._normalise_mac(device.mac_address)
+                            for device in devices_needing_deep_scan
+                        }
                         devices_to_scan = [
-                            {'ip': d.ip_address, 'mac': d.mac_address}
-                            for d in devices_needing_deep_scan
+                            {
+                                'ip': d.ip_address,
+                                'mac': d.mac_address,
+                                'profile': 'deep' if self._normalise_mac(d.mac_address) in deep_macs else 'light',
+                                'dhcp_info': (
+                                    lease_by_mac[self._normalise_mac(d.mac_address)].to_discovery_dict()
+                                    if self._normalise_mac(d.mac_address) in lease_by_mac else None
+                                ),
+                                'dhcp_status': 'no_match' if settings.DHCP_LEASE_FILE else 'not_configured',
+                            }
+                            for d in discovered
                         ]
-                        print(f"📋 Deep scan will check {len(devices_to_scan)} devices: {[d['ip'] for d in devices_to_scan]}")
+                        print(f"📋 Discovery scan will check {len(devices_to_scan)} devices: {[d['ip'] for d in devices_to_scan]}")
                         # Run deep scan with a global timeout to avoid blocking the main scan loop
                         enhanced_results = await asyncio.wait_for(
                             self.device_info_scanner.scan_network_enhanced(devices_to_scan),
@@ -638,18 +822,8 @@ class NetworkScanner:
                     if enhanced and enhanced.model:
                         model = enhanced.model
                     
-                    # Extract friendly name (from Avahi)
-                    friendly_name = None
-                    if enhanced and hasattr(enhanced, 'friendly_name'):
-                        friendly_name = enhanced.friendly_name
-                    elif enhanced and enhanced.hostnames:
-                        # Use the first hostname if no friendly name
-                        friendly_name = enhanced.hostnames[0] if enhanced.hostnames else None
-                    
-                    # Determine device type
-                    device_type = None
-                    if enhanced:
-                        device_type = enhanced.detected_type
+                    # Extract friendly name (from Avahi/UPnP)
+                    friendly_name = enhanced.friendly_name if enhanced else None
                     
                     # Get open ports as JSON string
                     open_ports_str = None
@@ -657,15 +831,27 @@ class NetworkScanner:
                         import json
                         open_ports_str = json.dumps(enhanced.open_ports)
                     
-                    # Get services as JSON string
+                    # Get all service names as JSON. Previously only the
+                    # first ten mDNS services were persisted, and port-based
+                    # services were discarded entirely before reaching the UI.
                     services_str = None
-                    if enhanced and enhanced.mdns_services:
-                        import json
-                        # Keep only first 10 services to avoid huge strings
-                        services_str = json.dumps(enhanced.mdns_services[:10])
+                    if enhanced:
+                        discovered_services = []
+                        for service in [*enhanced.mdns_services, *enhanced.services]:
+                            if service and service not in discovered_services:
+                                discovered_services.append(service)
+                        if discovered_services:
+                            services_str = json.dumps(discovered_services)
+
+                    discovery_info_str = self._serialise_discovery_info(enhanced)
                     
                     observed_mac = self._normalise_mac(disc_device.mac_address)
                     device = matched_devices.get(observed_mac) or device_lookup.get(observed_mac)
+                    identification = self._classify_device(
+                        enhanced,
+                        vendor=vendor,
+                        existing=device,
+                    ) if enhanced else None
                     if device is not None:
                         # Update existing device
                         old_ip = device.ip_address
@@ -704,13 +890,10 @@ class NetworkScanner:
                         if model:
                             device.model = model
                         
-                        # Update friendly name if we found one
-                        if friendly_name and not device.friendly_name:
+                        # Friendly names are inferred; the structured identity
+                        # profile below stays separate from user-entered type.
+                        if friendly_name:
                             device.friendly_name = friendly_name
-                        
-                        # Update device type if we detected one
-                        if device_type and not device.device_type:
-                            device.device_type = device_type
                         
                         # Update open ports
                         if open_ports_str:
@@ -718,7 +901,28 @@ class NetworkScanner:
                         
                         # Update services
                         if services_str:
-                            device.services = services_str
+                            merged_services = list(dict.fromkeys([
+                                *self._parse_json_list(device.services),
+                                *json.loads(services_str),
+                            ]))
+                            device.services = json.dumps(merged_services)
+
+                        # Keep protocol responses such as SSDP headers,
+                        # UPnP model data, HTTP server/title and every mDNS
+                        # hostname available for the details drawer.
+                        if discovery_info_str:
+                            device.discovery_info = self._merge_discovery_info(
+                                device.discovery_info,
+                                discovery_info_str,
+                            )
+                        if identification and self._should_store_identification(
+                            device.identification,
+                            identification,
+                            enhanced.scan_profile,
+                        ):
+                            device.set_identification(identification)
+                        if enhanced and enhanced.scan_profile != "light":
+                            device.last_deep_scan_at = datetime.now(timezone.utc)
                         
                         # Create events
                         if not was_online:
@@ -767,15 +971,19 @@ class NetworkScanner:
                             manufacturer=manufacturer,
                             model=model,
                             friendly_name=friendly_name,
-                            device_type=device_type,
                             open_ports=open_ports_str,
                             services=services_str,
+                            discovery_info=discovery_info_str,
                             is_online=True,
                             is_known=False,  # New device starts as unknown
                             missed_scans=0,
                             first_seen=datetime.now(timezone.utc),
                             last_seen=datetime.now(timezone.utc)
                         )
+                        if identification:
+                            device.set_identification(identification)
+                        if enhanced and enhanced.scan_profile != "light":
+                            device.last_deep_scan_at = datetime.now(timezone.utc)
                         session.add(device)
                         await session.flush()
                         

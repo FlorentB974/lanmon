@@ -8,6 +8,7 @@ A modern, real-time network device monitoring application inspired by [NetAlertX
 - 📡 **Real-time Updates**: WebSocket-based live updates when devices connect or disconnect
 - 📊 **Dashboard Statistics**: Overview of online/offline devices, new discoveries, and activity
 - 🏷️ **Device Management**: Customize names, add notes, and categorize your devices
+- 🧭 **Evidence-based Identification**: Likely device types with confidence and supporting network signals
 - ⭐ **Favorites**: Mark important devices for quick access
 - 📜 **Connection History**: Track device connection/disconnection events
 - 🌙 **Modern Dark UI**: Sleek, responsive interface with glass-morphism effects
@@ -73,6 +74,9 @@ Create a `.env` file in the `backend` directory:
 DATABASE_URL=sqlite+aiosqlite:///./lanmon.db
 SCAN_INTERVAL=60
 DEBUG=true
+# Optional: dnsmasq lease file or normalized JSON export, mounted read-only
+DHCP_LEASE_FILE=/app/leases/dhcp.leases
+DHCP_LEASE_FORMAT=auto
 ```
 
 ### Frontend Environment Variables
@@ -94,16 +98,43 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 | GET | `/api/devices/{id}/events` | Get device events |
 | GET | `/api/dashboard/stats` | Get dashboard statistics |
 | POST | `/api/scan/trigger` | Trigger network scan |
+| POST | `/api/devices/{id}/identify` | Run a broader bounded identification scan |
 | GET | `/api/scan/sessions` | Get scan history |
 | WS | `/ws` | WebSocket for real-time updates |
 
 ## Network Scanning
 
-The application uses multiple methods to discover devices:
+The application uses multiple methods to discover and identify devices:
 
 1. **Scapy ARP Scan**: Primary method using raw ARP requests
 2. **arp-scan**: Fallback command-line tool
 3. **System ARP Table**: Last resort using cached ARP entries
+4. **DNS-SD/mDNS and SSDP/UPnP**: Subnet-wide service and model discovery
+5. **Targeted fingerprints**: Bounded port, banner, HTTP, TLS, and NetBIOS probes
+
+Routine scans keep multicast and DNS discovery lightweight. New or incomplete
+devices receive deep probes at most once per day, while identified devices are
+refreshed weekly. The **Identify** action runs a broader native probe set for one
+online device after verifying that its IP still belongs to the stored MAC.
+
+### Optional DHCP lease format
+
+`DHCP_LEASE_FORMAT=auto` recognizes dnsmasq lease files and a normalized JSON
+array. JSON entries have this shape:
+
+```json
+[
+  {
+    "mac_address": "aa:bb:cc:dd:ee:ff",
+    "ip_address": "192.168.1.20",
+    "hostname": "living-room",
+    "vendor_class": "optional vendor class",
+    "expires_at": "2026-08-30T12:00:00Z"
+  }
+]
+```
+
+The lease source is only read; malformed and expired entries are ignored.
 
 > **Note**: Network scanning typically requires elevated privileges (sudo/admin).
 

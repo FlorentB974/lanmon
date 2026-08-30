@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Router,
   Search,
+  Server,
   Smartphone,
   Speaker,
   Star,
@@ -70,6 +71,16 @@ function parseMacAliases(device: Device): string[] {
   try {
     const aliases = JSON.parse(device.mac_aliases);
     return Array.isArray(aliases) ? aliases : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseStringArray(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
   } catch {
     return [];
   }
@@ -243,6 +254,10 @@ export default function Home() {
       setScanning(false);
       void fetchData();
     }
+
+    if (lastMessage.type === "device_identified") {
+      void fetchData();
+    }
   }, [lastMessage, fetchData]);
 
   // The WebSocket is the fast path, while this low-frequency check prevents
@@ -393,6 +408,10 @@ export default function Home() {
         device.vendor,
         device.manufacturer,
         device.model,
+        device.identification?.label,
+        device.identification?.category,
+        device.services,
+        device.discovery_info,
       ].some((value) => value?.toLowerCase().includes(searchLower));
 
       const matchesFilter = filter === "all"
@@ -525,7 +544,7 @@ export default function Home() {
                   ["all", "All"],
                   ["online", "Online"],
                   ["offline", "Offline"],
-                  ["new", "New"],
+                  ["new", "Needs review"],
                   ["known", "Known"],
                 ] as [Filter, string][]).map(([key, label]) => (
                   <button
@@ -643,6 +662,7 @@ export default function Home() {
                     const isSelected = selectedDevice?.id === device.id;
                     const isBulkSelected = selectedDeviceIds.has(device.id);
                     const aliases = parseMacAliases(device);
+                    const services = parseStringArray(device.services);
                     const macRotationDetected = device.mac_rotation_detected ?? aliases.length > 0;
                     return (
                       <tr
@@ -677,7 +697,7 @@ export default function Home() {
                               <div className="flex items-center gap-2">
                                 <p className="truncate text-sm font-medium text-white">{deviceName(device)}</p>
                                 {device.is_favorite && <Star className="h-3.5 w-3.5 shrink-0 fill-amber-400 text-amber-400" />}
-                                {!device.is_known && <span className="rounded-full bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">New</span>}
+                                {!device.is_known && <span className="rounded-full bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">Review</span>}
                                 {macRotationDetected && <span className="rounded-full bg-sky-400/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">Rotating MAC</span>}
                                 {!macRotationDetected && device.is_private_mac && <span className="rounded-full bg-violet-400/10 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">Private MAC</span>}
                               </div>
@@ -685,7 +705,12 @@ export default function Home() {
                             </div>
                           </div>
                         </td>
-                        <td className="px-3 py-3.5 font-mono text-xs text-slate-300">{device.ip_address || "—"}</td>
+                        <td className="px-3 py-3.5 font-mono text-xs text-slate-300">
+                          <p>{device.ip_address || "—"}</p>
+                          {device.hostname && device.hostname !== deviceName(device) && (
+                            <p className="mt-1 truncate font-sans text-[11px] text-slate-600" title={device.hostname}>{device.hostname}</p>
+                          )}
+                        </td>
                         <td className="px-3 py-3.5">
                           <span className={cn("inline-flex items-center gap-1.5 text-xs", device.is_online ? "text-emerald-400" : "text-slate-500")}>
                             {device.is_online ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
@@ -694,7 +719,7 @@ export default function Home() {
                         </td>
                         <td className="px-3 py-3.5">
                           <p className="truncate text-xs text-slate-300">{device.manufacturer || device.vendor || "Unknown vendor"}</p>
-                          <p className="mt-0.5 truncate text-[11px] text-slate-600">{device.device_type || device.model || "Unclassified"}</p>
+                          <p className="mt-0.5 truncate text-[11px] text-slate-600">{device.effective_device_type || device.model || "Unclassified"}</p>
                         </td>
                         <td className="px-3 py-3.5 text-xs text-slate-500">{timeAgo(device.last_seen)}</td>
                         <td className="px-3 py-3.5">

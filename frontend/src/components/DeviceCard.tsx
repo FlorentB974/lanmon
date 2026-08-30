@@ -108,10 +108,10 @@ export default function DeviceCard({ device, onClick, index }: DeviceCardProps) 
         <Star className="absolute top-3 right-3 w-4 h-4 text-yellow-400 fill-yellow-400" />
       )}
       
-      {/* New device badge */}
+      {/* Review-state badge */}
       {!device.is_known && !device.is_favorite && (
         <span className="absolute top-3 right-3 px-2 py-0.5 bg-yellow-500/20 text-yellow-400 text-xs rounded-full">
-          New
+          Review
         </span>
       )}
       
@@ -145,9 +145,9 @@ export default function DeviceCard({ device, onClick, index }: DeviceCardProps) 
                 {device.ip_address}
               </p>
             )}
-            {device.device_type && (
+            {device.effective_device_type && (
               <span className="text-xs px-1.5 py-0.5 bg-brand-500/20 text-brand-300 rounded">
-                {device.device_type}
+                {device.effective_device_type}
               </span>
             )}
           </div>

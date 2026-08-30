@@ -1,6 +1,6 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
-from typing import Optional
+from typing import Literal, Optional
 
 
 class Settings(BaseSettings):
@@ -22,8 +22,14 @@ class Settings(BaseSettings):
     DEFAULT_SUBNET: Optional[str] = None  # Auto-detect if None
     
     # Deep Scan Optimization
-    DEEP_SCAN_COMPLETE_INFO_SKIP_HOURS: int = 24  # Skip deep scan if device has complete info and was updated within this many hours
-    DEEP_SCAN_PERIODIC_REFRESH_DAYS: int = 7  # Force deep scan of complete devices after this many days
+    DEEP_SCAN_PERIODIC_REFRESH_DAYS: int = 7  # Refresh useful identity profiles
+    DEEP_SCAN_INCOMPLETE_REFRESH_HOURS: int = 24
+    IDENTIFY_COOLDOWN_SECONDS: int = 60
+
+    # Optional read-only DHCP lease enrichment. ``auto`` recognizes dnsmasq's
+    # five-column format and the normalized JSON format documented in README.
+    DHCP_LEASE_FILE: Optional[str] = None
+    DHCP_LEASE_FORMAT: Literal["auto", "dnsmasq", "json"] = "auto"
     
     # CORS
     CORS_ORIGINS: list[str] = ["*"]

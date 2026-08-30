@@ -23,7 +23,14 @@ class ApiClient {
     });
 
     if (!response.ok) {
-      throw new Error(`API Error: ${response.status} ${response.statusText}`);
+      let detail = response.statusText;
+      try {
+        const payload = await response.json();
+        if (typeof payload?.detail === "string") detail = payload.detail;
+      } catch {
+        // The status text remains a useful fallback for empty error bodies.
+      }
+      throw new Error(detail || `API Error: ${response.status}`);
     }
 
     return response.json();
@@ -70,6 +77,10 @@ class ApiClient {
     return this.fetch<ScanEvent[]>(
       `/api/devices/${id}/events?limit=${limit}`
     );
+  }
+
+  async identifyDevice(id: number): Promise<Device> {
+    return this.fetch<Device>(`/api/devices/${id}/identify`, { method: "POST" });
   }
 
   // Dashboard

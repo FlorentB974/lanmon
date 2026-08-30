@@ -1,10 +1,12 @@
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 from app.db.models import Device
 from app.scanner.arp_scanner import DiscoveredDevice
 from app.scanner.network_scanner import NetworkScanner
+from app.scanner.network_scanner import DeviceIdentityMismatchError, IdentificationCooldownError
 
 
 class FakeSession:
@@ -149,6 +151,76 @@ class RotatingMacTests(unittest.TestCase):
         self.assertIn("60:f4:45:d9:8e:54", json.loads(target.mac_aliases))
         self.assertIn("b6:95:2b:e1:ae:d0", json.loads(target.mac_aliases))
         self.assertIn(source, session.deleted)
+
+    def test_deep_scan_uses_dedicated_timestamp_not_updated_at(self):
+        device = self.device(1, "44:da:30:52:2d:30")
+        device.updated_at = datetime.now(timezone.utc)
+        device.last_deep_scan_at = datetime.now(timezone.utc) - timedelta(hours=25)
+        device.set_identification({"label": None, "confidence": None})
+
+        self.assertTrue(self.scanner._should_deep_scan_device(device))
+
+    def test_complete_identification_uses_weekly_refresh(self):
+        device = self.device(1, "44:da:30:52:2d:30")
+        device.last_deep_scan_at = datetime.now(timezone.utc) - timedelta(days=2)
+        device.set_identification({"label": "Apple iPhone", "confidence": "high"})
+
+        self.assertFalse(self.scanner._should_deep_scan_device(device))
+
+
+class FakeResult:
+    def __init__(self, device):
+        self.device = device
+
+    def scalar_one_or_none(self):
+        return self.device
+
+
+class FakeAsyncSession:
+    def __init__(self, device):
+        self.device = device
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def execute(self, _statement):
+        return FakeResult(self.device)
+
+    async def rollback(self):
+        return None
+
+
+class TargetedIdentificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_identification_enforces_cooldown(self):
+        scanner = NetworkScanner()
+        device = Device(
+            id=1,
+            mac_address="44:da:30:52:2d:30",
+            mac_aliases="[]",
+            ip_address="192.168.1.20",
+            is_online=True,
+            last_deep_scan_at=datetime.now(timezone.utc),
+        )
+        with patch("app.scanner.network_scanner.AsyncSessionLocal", return_value=FakeAsyncSession(device)):
+            with self.assertRaises(IdentificationCooldownError):
+                await scanner.identify_device(device.id)
+
+    async def test_manual_identification_rejects_ip_mac_mismatch(self):
+        scanner = NetworkScanner()
+        device = Device(
+            id=1,
+            mac_address="44:da:30:52:2d:30",
+            mac_aliases="[]",
+            ip_address="192.168.1.20",
+            is_online=True,
+        )
+        scanner.arp_scanner.resolve_mac = AsyncMock(return_value="00:11:22:33:44:55")
+        with patch("app.scanner.network_scanner.AsyncSessionLocal", return_value=FakeAsyncSession(device)):
+            with self.assertRaises(DeviceIdentityMismatchError):
+                await scanner.identify_device(device.id)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,9 @@ import {
   Lock,
   Server,
   AlertCircle,
+  CheckCircle2,
+  RefreshCw,
+  ScanSearch,
 } from "lucide-react";
 import { Device, ScanEvent } from "@/types";
 import { api } from "@/lib/api";
@@ -93,6 +96,48 @@ function parseMacAliases(macAliases: string | null): string[] {
   }
 }
 
+interface DiscoveryInfo {
+  hostnames?: string[];
+  friendly_name?: string | null;
+  mdns_services?: string[];
+  network_services?: string[];
+  netbios_name?: string | null;
+  ssdp?: Record<string, unknown>;
+  upnp?: Record<string, unknown>;
+  http?: Record<string, unknown>;
+  banners?: Record<string, string>;
+  tls?: Record<string, unknown>;
+  dhcp?: Record<string, unknown>;
+  probes?: Record<string, string>;
+}
+
+function parseDiscoveryInfo(discoveryInfo: string | null): DiscoveryInfo {
+  if (!discoveryInfo) return {};
+  try {
+    const parsed = JSON.parse(discoveryInfo);
+    return parsed && typeof parsed === "object" ? parsed as DiscoveryInfo : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseServices(servicesValue: string | null, discoveryInfo: DiscoveryInfo): string[] {
+  const values = [
+    ...(() => {
+      if (!servicesValue) return [];
+      try {
+        const parsed = JSON.parse(servicesValue);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    })(),
+    ...(discoveryInfo.mdns_services || []),
+    ...(discoveryInfo.network_services || []),
+  ];
+  return values.filter((value, index): value is string => typeof value === "string" && values.indexOf(value) === index);
+}
+
 function getPortInfo(port: number) {
   return portInfo[port] || { name: port.toString(), description: "Unknown Service", icon: Network };
 }
@@ -108,6 +153,8 @@ const deviceTypes = [
   { value: "printer", label: "Printer" },
   { value: "camera", label: "Camera" },
   { value: "speaker", label: "Speaker/Audio" },
+  { value: "nas", label: "NAS/Storage" },
+  { value: "server", label: "Server" },
   { value: "iot", label: "IoT/Smart Device" },
   { value: "other", label: "Other" },
 ];
@@ -125,6 +172,8 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [events, setEvents] = useState<ScanEvent[]>([]);
   const [loading, setLoading] = useState(false);
+  const [identifying, setIdentifying] = useState(false);
+  const [acceptingSuggestion, setAcceptingSuggestion] = useState(false);
   const [actionLoading, setActionLoading] = useState<"favorite" | "known" | null>(null);
   const [error, setError] = useState<string | null>(null);
   
@@ -139,6 +188,8 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
   const iconKey = getDeviceIcon(device);
   const Icon = iconMap[iconKey] || HelpCircle;
   const macAliases = parseMacAliases(device.mac_aliases);
+  const discoveryInfo = parseDiscoveryInfo(device.discovery_info);
+  const discoveredServices = parseServices(device.services, discoveryInfo);
 
   useEffect(() => {
     setForm({
@@ -219,6 +270,37 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
       setError("Could not mark this device as known. Please try again.");
     } finally {
       setActionLoading(null);
+    }
+  };
+
+  const handleIdentify = async () => {
+    setIdentifying(true);
+    setError(null);
+    try {
+      const updated = await api.identifyDevice(device.id);
+      onUpdate(updated);
+    } catch (error) {
+      console.error("Failed to identify device:", error);
+      setError(error instanceof Error ? error.message : "Could not identify this device.");
+    } finally {
+      setIdentifying(false);
+    }
+  };
+
+  const handleAcceptSuggestion = async () => {
+    const category = device.identification?.category;
+    if (!category) return;
+    setAcceptingSuggestion(true);
+    setError(null);
+    try {
+      const updated = await api.updateDevice(device.id, { device_type: category });
+      setForm((current) => ({ ...current, device_type: category }));
+      onUpdate(updated);
+    } catch (error) {
+      console.error("Failed to accept suggestion:", error);
+      setError(error instanceof Error ? error.message : "Could not accept this suggestion.");
+    } finally {
+      setAcceptingSuggestion(false);
     }
   };
 
@@ -366,12 +448,12 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
             </div>
           )}
 
-          {/* New device banner */}
+          {/* User acknowledgement is separate from scanner confidence. */}
           {!device.is_known && (
             <div className="mb-6 p-4 bg-yellow-500/10 border border-yellow-500/30 rounded-lg flex items-center justify-between">
               <div>
-                <p className="font-medium text-yellow-400">New Device Detected</p>
-                <p className="text-sm text-slate-400">This device was recently discovered on your network</p>
+                <p className="font-medium text-yellow-400">Device needs review</p>
+                <p className="text-sm text-slate-400">Acknowledge it after deciding whether it belongs on your network.</p>
               </div>
               <button
                 onClick={handleMarkKnown}
@@ -382,6 +464,93 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
               </button>
             </div>
           )}
+
+          {/* Evidence-based scanner suggestion, kept separate from user type. */}
+          <div className="mb-6 rounded-xl border border-brand-500/20 bg-brand-500/[0.06] p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <ScanSearch className="h-4 w-4 text-brand-400" />
+                  <p className="text-sm font-semibold text-white">Scanner identification</p>
+                </div>
+                {device.identification?.label ? (
+                  <div className="mt-2">
+                    <p className="text-base text-brand-100">
+                      Likely {device.identification.label}
+                      {device.identification.confidence && (
+                        <span className={cn(
+                          "ml-2 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                          device.identification.confidence === "high"
+                            ? "bg-emerald-500/15 text-emerald-300"
+                            : device.identification.confidence === "medium"
+                              ? "bg-amber-500/15 text-amber-300"
+                              : "bg-slate-500/20 text-slate-300",
+                        )}>
+                          {device.identification.confidence} confidence
+                        </span>
+                      )}
+                    </p>
+                    {device.device_type && (
+                      <p className="mt-1 text-xs text-slate-500">Your type remains “{device.device_type}”. Scanner results never overwrite it.</p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="mt-2 text-sm text-slate-400">
+                    {device.identification?.ambiguous
+                      ? "The available signals disagree, so no type was suggested."
+                      : "There is not enough evidence for a reliable suggestion yet."}
+                  </p>
+                )}
+              </div>
+              <div className="flex shrink-0 gap-2">
+                {device.identification?.category && device.device_type !== device.identification.category && (
+                  <button
+                    onClick={() => void handleAcceptSuggestion()}
+                    disabled={acceptingSuggestion || identifying}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-300 transition-colors hover:bg-emerald-500/20 disabled:opacity-50"
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    {acceptingSuggestion ? "Accepting" : "Accept"}
+                  </button>
+                )}
+                <button
+                  onClick={() => void handleIdentify()}
+                  disabled={identifying || !device.is_online}
+                  title={!device.is_online ? "The device must be online" : "Run broader bounded probes"}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-brand-500 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <RefreshCw className={cn("h-3.5 w-3.5", identifying && "animate-spin")} />
+                  {identifying ? "Identifying" : "Identify"}
+                </button>
+              </div>
+            </div>
+
+            {device.identification?.evidence && device.identification.evidence.length > 0 && (
+              <div className="mt-4 space-y-2 border-t border-brand-500/15 pt-3">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Evidence</p>
+                {device.identification.evidence.map((item, index) => (
+                  <div key={`${item.source}-${item.value}-${index}`} className="flex items-start gap-2 text-xs">
+                    <span className={cn(
+                      "mt-0.5 rounded px-1.5 py-0.5 font-medium uppercase",
+                      item.strength === "strong" ? "bg-emerald-500/10 text-emerald-300" :
+                        item.strength === "medium" ? "bg-amber-500/10 text-amber-300" : "bg-slate-700 text-slate-400",
+                    )}>{item.source}</span>
+                    <span className="text-slate-400">{item.summary}: <span className="font-mono text-slate-300">{item.value}</span></span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {device.identification?.probes && Object.keys(device.identification.probes).length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-1.5 border-t border-brand-500/15 pt-3">
+                {Object.entries(device.identification.probes).map(([source, status]) => (
+                  <span key={source} className="rounded bg-surface-900/60 px-2 py-1 text-[10px] text-slate-500">
+                    {source}: {status.replaceAll("_", " ")}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
 
           {/* Device Info Grid */}
           <div className="grid grid-cols-2 gap-4 mb-6">
@@ -402,6 +571,12 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
               <p className="text-xs text-slate-500 uppercase tracking-wider">IP Address</p>
               <p className="font-mono text-white mt-1">{device.ip_address || "—"}</p>
             </div>
+            {device.hostname && (
+              <div className="p-3 bg-surface-800/50 rounded-lg">
+                <p className="text-xs text-slate-500 uppercase tracking-wider">Hostname</p>
+                <p className="text-white mt-1 break-words">{device.hostname}</p>
+              </div>
+            )}
             {device.model && (
               <div className="p-3 bg-surface-800/50 rounded-lg">
                 <p className="text-xs text-slate-500 uppercase tracking-wider">Model</p>
@@ -469,44 +644,62 @@ export default function DeviceModal({ device, onClose, onUpdate, onDelete }: Dev
             );
           })()}
 
-          {/* mDNS Services Section */}
-          {(() => {
-            if (!device.services) return null;
-            
-            let services: string[] = [];
-            try {
-              const parsed = JSON.parse(device.services);
-              services = Array.isArray(parsed) ? parsed : [];
-            } catch {
-              services = [];
-            }
-            
-            if (services.length === 0) return null;
-            
+          {/* Hostnames and protocol discovery */}
+          {(discoveryInfo.hostnames?.length || discoveryInfo.netbios_name) && (
+            <div className="mb-6">
+              <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                <Globe className="w-4 h-4" />
+                Discovered Hostnames
+              </h3>
+              <div className="flex flex-wrap gap-2">
+                {[...(discoveryInfo.hostnames || []), ...(discoveryInfo.netbios_name ? [discoveryInfo.netbios_name] : [])]
+                  .filter((hostname, index, values) => hostname && values.indexOf(hostname) === index)
+                  .map((hostname) => (
+                    <span key={hostname} className="rounded-lg bg-surface-800/50 px-3 py-2 font-mono text-xs text-slate-300">
+                      {hostname}
+                    </span>
+                  ))}
+              </div>
+            </div>
+          )}
+
+          {discoveredServices.length > 0 && (
+            <div className="mb-6">
+              <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                <Server className="w-4 h-4" />
+                Discovered Services ({discoveredServices.length})
+              </h3>
+              <div className="space-y-2">
+                {discoveredServices.map((service, idx) => (
+                  <div key={`${service}-${idx}`} className="p-2 bg-surface-800/50 rounded-lg text-xs text-slate-300 font-mono break-words">
+                    {service}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {(["ssdp", "upnp", "http"] as const).map((section) => {
+            const values = discoveryInfo[section];
+            if (!values || Object.keys(values).length === 0) return null;
+            const title = section === "ssdp" ? "SSDP Response" : section === "upnp" ? "UPnP Details" : "HTTP Details";
             return (
-              <div className="mb-6">
+              <div key={section} className="mb-6">
                 <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                  <Server className="w-4 h-4" />
-                  Discovered Services ({services.length})
+                  <Network className="w-4 h-4" />
+                  {title}
                 </h3>
                 <div className="space-y-2">
-                  {services.slice(0, 10).map((service, idx) => (
-                    <div
-                      key={idx}
-                      className="p-2 bg-surface-800/50 rounded-lg text-sm text-slate-300 font-mono text-xs"
-                    >
-                      {service}
+                  {Object.entries(values).map(([key, value]) => (
+                    <div key={key} className="grid grid-cols-[minmax(90px,0.35fr)_1fr] gap-3 rounded-lg bg-surface-800/50 p-2 text-xs">
+                      <span className="text-slate-500">{key}</span>
+                      <span className="break-words font-mono text-slate-300">{String(value)}</span>
                     </div>
                   ))}
-                  {services.length > 10 && (
-                    <p className="text-xs text-slate-500 text-center pt-2">
-                      +{services.length - 10} more services
-                    </p>
-                  )}
                 </div>
               </div>
             );
-          })()}
+          })}
 
           {/* Edit Section */}
           {isEditing ? (

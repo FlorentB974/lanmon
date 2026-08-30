@@ -26,6 +26,8 @@ class Device(Base):
     custom_name = Column(String(255))
     notes = Column(Text)
     services = Column(Text)  # JSON string of discovered services
+    discovery_info = Column(Text)  # JSON details from mDNS, SSDP, NetBIOS and HTTP
+    identification_data = Column("identification", Text)
     
     # Status
     is_online = Column(Boolean, default=False)
@@ -38,6 +40,8 @@ class Device(Base):
     last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    # Unlike updated_at, this only changes after active fingerprint probes.
+    last_deep_scan_at = Column(DateTime)
     
     # Network info
     open_ports = Column(Text)  # JSON string of open ports
@@ -70,6 +74,26 @@ class Device(Base):
             return isinstance(aliases, list) and any(aliases)
         except (TypeError, ValueError):
             return False
+
+    @property
+    def identification(self):
+        """Return the scanner's typed identity suggestion."""
+        try:
+            value = json.loads(self.identification_data or "null")
+            return value if isinstance(value, dict) else None
+        except (TypeError, ValueError):
+            return None
+
+    def set_identification(self, value) -> None:
+        self.identification_data = json.dumps(value, sort_keys=True) if value else None
+
+    @property
+    def effective_device_type(self):
+        """Prefer the user's category, then the scanner suggestion."""
+        if self.device_type:
+            return self.device_type
+        identification = self.identification
+        return identification.get("category") if identification else None
     
     # Relationships
     scan_events = relationship("ScanEvent", back_populates="device", cascade="all, delete-orphan")

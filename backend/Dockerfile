@@ -33,6 +33,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         arp-scan \
+        avahi-utils \
         iputils-ping \
         net-tools \
     && rm -rf /var/lib/apt/lists/*

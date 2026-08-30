@@ -16,12 +16,11 @@ _oui_cache: Dict[str, str] = {}
 _cache_loaded = False
 
 
-def _normalize_mac_prefix(mac: str) -> str:
-    """Normalize MAC address prefix to uppercase without separators."""
+def _normalize_mac(mac: str) -> str:
+    """Normalize a MAC address or registry prefix without separators."""
     # Remove separators and convert to uppercase
     mac_clean = mac.upper().replace(':', '').replace('-', '').replace('.', '')
-    # Return first 6 characters (OUI prefix)
-    return mac_clean[:6]
+    return mac_clean
 
 
 def _load_oui_database():
@@ -78,21 +77,21 @@ def lookup_vendor(mac: str) -> Optional[str]:
     if not mac:
         return None
     
-    # Normalize the MAC prefix
-    prefix = _normalize_mac_prefix(mac)
-    
-    # Try exact 6-character (24-bit) OUI match first
-    if prefix in _oui_cache:
-        return _oui_cache[prefix]
-    
-    # Some vendors use 7 or 9 character prefixes (MA-M and MA-S blocks)
-    # Try shorter prefixes as fallback
-    for length in [7, 8, 9]:
-        mac_clean = mac.upper().replace(':', '').replace('-', '').replace('.', '')
-        if len(mac_clean) >= length:
-            extended_prefix = mac_clean[:length]
-            if extended_prefix in _oui_cache:
-                return _oui_cache[extended_prefix]
+    mac_clean = _normalize_mac(mac)
+    if len(mac_clean) != 12 or any(character not in "0123456789ABCDEF" for character in mac_clean):
+        return None
+
+    # Locally administered addresses are privacy/container addresses. Their
+    # first bytes are not an IEEE assignment and must not produce an OUI hit.
+    if int(mac_clean[:2], 16) & 0x02:
+        return None
+
+    # Prefer the most-specific MA-S/MA-M assignment before the older 24-bit
+    # MA-L prefix. Checking MA-L first made every more-specific record dead.
+    for length in range(min(len(mac_clean), 12), 5, -1):
+        vendor = _oui_cache.get(mac_clean[:length])
+        if vendor:
+            return vendor
     
     return None
 

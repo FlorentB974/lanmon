@@ -7,8 +7,17 @@ services:
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/lanmon.db
       - SCAN_INTERVAL=300
+      # Optional read-only DHCP enrichment. Mount a dnsmasq lease file or a
+      # normalized JSON export and uncomment both lines.
+      # - DHCP_LEASE_FILE=/app/leases/dhcp.leases
+      # - DHCP_LEASE_FORMAT=auto
     volumes:
       - ./data:/app/data
+      # Let avahi-browse use the host Avahi daemon's live mDNS cache/browse.
+      # The backend still falls back to direct Zeroconf when this socket is
+      # unavailable.
+      - /run/avahi-daemon/socket:/run/avahi-daemon/socket:ro
+      # - /path/on/host/dhcp.leases:/app/leases/dhcp.leases:ro
     # Network scanning requires special privileges
     # NOTE: On macOS/Windows, Docker runs in a VM so network scanning won't work.
     # For full LAN scanning on macOS/Windows, run the backend natively.

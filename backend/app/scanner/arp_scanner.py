@@ -786,6 +786,24 @@ class ARPScanner:
             pass
         
         return False
+
+    async def resolve_mac(self, ip: str) -> Optional[str]:
+        """Resolve the current layer-2 owner of an IP for safe targeted probes."""
+        if SCAPY_AVAILABLE:
+            try:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(None, self._arp_probe, ip)
+                if result:
+                    return result.lower()
+            except Exception:
+                pass
+        try:
+            for device in await self._get_arp_table():
+                if device.ip_address == ip:
+                    return device.mac_address.lower()
+        except Exception:
+            pass
+        return None
     
     def _arp_probe(self, ip: str) -> Optional[str]:
         """Send ARP probe to specific IP and return MAC if found."""
@@ -962,6 +980,13 @@ class ARPScanner:
     
     def _lookup_vendor(self, mac: str) -> Optional[str]:
         """Look up vendor from MAC address using OUI database."""
+        try:
+            compact = mac.lower().replace(':', '').replace('-', '').replace('.', '')
+            if len(compact) == 12 and int(compact[:2], 16) & 0x02:
+                return None
+        except (ValueError, IndexError):
+            return None
+
         # Use our local OUI database lookup
         vendor = oui_lookup_vendor(mac)
         if vendor:

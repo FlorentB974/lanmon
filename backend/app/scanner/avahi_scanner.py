@@ -10,7 +10,9 @@ The avahi-browse command with -ratpc flags provides:
 - -a: Show all service types
 - -t: Terminate after browsing
 - -p: Parseable output format
-- -c: Use cached services (faster)
+
+The scanner deliberately does not use ``-c``.  That flag makes avahi-browse
+dump only the daemon's current cache instead of actively browsing the LAN.
 """
 
 import asyncio
@@ -149,8 +151,17 @@ class AvahiScanner:
         if not self.is_available():
             return {}
         
-        # Build command
-        cmd = ['avahi-browse', '-ratpc']
+        # Build a live browse command.  ``-c`` is intentionally absent: it
+        # means "cache only" and was the reason fresh mDNS services stopped
+        # appearing after the Avahi integration was added.
+        cmd = [
+            'avahi-browse',
+            '--all',
+            '--resolve',
+            '--terminate',
+            '--parsable',
+            '--no-fail',
+        ]
         if interface:
             # Filter by interface happens in parsing, not in command
             pass
@@ -171,6 +182,9 @@ class AvahiScanner:
             
             # Parse the output
             devices = self._parse_avahi_output(output, target_ips, interface)
+
+            if stderr:
+                logger.debug("avahi-browse: %s", stderr.decode('utf-8', errors='ignore').strip())
             
             # Update cache
             self._cache = devices
@@ -180,6 +194,9 @@ class AvahiScanner:
             return devices
             
         except asyncio.TimeoutError:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
             logger.warning("Avahi scan timed out")
             return self._cache
         except Exception as e:
@@ -399,7 +416,7 @@ class AvahiScanner:
         if not device.model:
             if 'am' in txt:
                 value = txt['am']
-                if value and len(value) > 2:
+                if value and len(value) > 2 and not re.fullmatch(r'\d+(?:,\d+)+', value.strip()):
                     device.model = value
         
         # Manufacturer detection - be selective
@@ -414,7 +431,9 @@ class AvahiScanner:
         
         # For Apple companion-link, extract model from rpMd
         if 'rpMd' in txt and not device.model:
-            device.model = txt['rpMd']
+            value = txt['rpMd']
+            if value and not re.fullmatch(r'\d+(?:,\d+)+', value.strip()):
+                device.model = value
         
         # For Googlecast, extract friendly name from 'fn'
         if 'fn' in txt:
