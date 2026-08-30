@@ -1,6 +1,6 @@
 # LAN Monitor
 
-A modern, real-time network device monitoring application inspired by [NetAlertX](https://github.com/jokob-sk/NetAlertX).
+A modern, real-time network device monitoring application.
 
 ## Features
 
